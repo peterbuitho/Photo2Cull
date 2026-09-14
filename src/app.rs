@@ -17,6 +17,30 @@ struct PhotoEntry {
     texture: TextureHandle,
 }
 
+/// The image cap for the double-click "full size" preview. Not the true
+/// original resolution (which could be 40-100MP and slow/wasteful to
+/// decode and hold as a GPU texture just to fit it on screen) -- big enough
+/// to judge focus at full-window size.
+const PREVIEW_MAX_DIM: usize = 2400;
+
+struct Viewer {
+    path: PathBuf,
+    /// `None` while the full-size decode is still in flight.
+    texture: Option<TextureHandle>,
+}
+
+enum PreviewEvent {
+    Loaded {
+        path: PathBuf,
+        w: u32,
+        h: u32,
+        rgb: Vec<u8>,
+    },
+    Failed {
+        path: PathBuf,
+    },
+}
+
 pub struct Photo2CullApp {
     root: Option<PathBuf>,
     scan_mode: ScanMode,
@@ -29,6 +53,8 @@ pub struct Photo2CullApp {
     recompute_rx: Option<Receiver<RecomputeEvent>>,
     recomputing: bool,
     cull_percentile: f32,
+    viewer: Option<Viewer>,
+    preview_rx: Option<Receiver<PreviewEvent>>,
 }
 
 impl Photo2CullApp {
@@ -45,6 +71,65 @@ impl Photo2CullApp {
             recompute_rx: None,
             recomputing: false,
             cull_percentile: 20.0,
+            viewer: None,
+            preview_rx: None,
+        }
+    }
+
+    /// Load `path` at a larger size for the double-click "full size" view.
+    fn start_preview_load(&mut self, path: PathBuf) {
+        self.viewer = Some(Viewer {
+            path: path.clone(),
+            texture: None,
+        });
+        let (tx, rx) = channel();
+        self.preview_rx = Some(rx);
+        thread::spawn(move || {
+            let event = match crate::raw::decode_raw(&path, PREVIEW_MAX_DIM) {
+                Ok(img) => PreviewEvent::Loaded {
+                    path,
+                    w: img.width(),
+                    h: img.height(),
+                    rgb: img.into_raw(),
+                },
+                Err(_) => PreviewEvent::Failed { path },
+            };
+            let _ = tx.send(event);
+        });
+    }
+
+    fn drain_preview(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.preview_rx else {
+            return;
+        };
+        // Only ever one message per load; take the last if somehow more.
+        let mut last = None;
+        while let Ok(event) = rx.try_recv() {
+            last = Some(event);
+        }
+        let Some(event) = last else {
+            return;
+        };
+        self.preview_rx = None;
+        match event {
+            PreviewEvent::Loaded { path, w, h, rgb } => {
+                if self.viewer.as_ref().is_some_and(|v| v.path == path) {
+                    let image = ColorImage::from_rgb([w as usize, h as usize], &rgb);
+                    let texture = ctx.load_texture(
+                        format!("preview-{}", path.display()),
+                        image,
+                        TextureOptions::LINEAR,
+                    );
+                    if let Some(v) = &mut self.viewer {
+                        v.texture = Some(texture);
+                    }
+                }
+            }
+            PreviewEvent::Failed { path } => {
+                if self.viewer.as_ref().is_some_and(|v| v.path == path) {
+                    self.viewer = None;
+                }
+            }
         }
     }
 
@@ -141,6 +226,53 @@ impl Photo2CullApp {
         }
     }
 
+    fn show_viewer(&mut self, ctx: &egui::Context) {
+        let Some(viewer) = &self.viewer else {
+            return;
+        };
+        let name = viewer
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        let mut close = false;
+        egui::Window::new("photo-viewer")
+            .title_bar(false)
+            .resizable(false)
+            .movable(false)
+            .collapsible(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .frame(egui::Frame::popup(&ctx.style_of(ctx.theme())))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading(name);
+                    if ui.button("✕").clicked() {
+                        close = true;
+                    }
+                });
+                ui.separator();
+                match &viewer.texture {
+                    Some(tex) => {
+                        let avail = ctx.content_rect().size() * 0.85;
+                        let size = tex.size_vec2();
+                        let scale = (avail.x / size.x).min(avail.y / size.y).min(1.0);
+                        ui.image((tex.id(), size * scale));
+                    }
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Loading full size…");
+                        });
+                    }
+                }
+            });
+
+        if close || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.viewer = None;
+        }
+    }
+
     /// Score below which entries are flagged, given the current percentile.
     fn cull_cutoff(&self) -> Option<f64> {
         if self.entries.is_empty() {
@@ -158,7 +290,9 @@ impl eframe::App for Photo2CullApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
-        if self.scanning || self.recomputing {
+        self.drain_preview(&ctx);
+        if self.scanning || self.recomputing || self.viewer.as_ref().is_some_and(|v| v.texture.is_none())
+        {
             ctx.request_repaint();
         }
 
@@ -267,6 +401,8 @@ impl eframe::App for Photo2CullApp {
                     .unwrap()
             });
 
+            let mut open_request: Option<PathBuf> = None;
+
             egui::ScrollArea::vertical().show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for idx in order {
@@ -278,7 +414,12 @@ impl eframe::App for Photo2CullApp {
                                 let size = entry.texture.size_vec2();
                                 let max_dim = 160.0_f32;
                                 let scale = (max_dim / size.x.max(size.y)).min(1.0);
-                                ui.image((entry.texture.id(), size * scale));
+                                let image_response = ui
+                                    .image((entry.texture.id(), size * scale))
+                                    .interact(egui::Sense::click());
+                                if image_response.double_clicked() {
+                                    open_request = Some(entry.path.clone());
+                                }
                                 let name = entry
                                     .path
                                     .file_name()
@@ -320,6 +461,12 @@ impl eframe::App for Photo2CullApp {
                     }
                 });
             });
+
+            if let Some(path) = open_request {
+                self.start_preview_load(path);
+            }
         });
+
+        self.show_viewer(&ctx);
     }
 }
