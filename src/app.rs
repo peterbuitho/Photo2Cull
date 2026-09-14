@@ -4,18 +4,19 @@ use std::thread;
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
 
-use crate::scan::{run_scan, ScanEvent};
+use crate::scan::{run_scan, ScanEvent, ScanMode};
 use crate::sharpness::PhotoMode;
 
 struct PhotoEntry {
     path: PathBuf,
+    mode: PhotoMode,
     score: f64,
     texture: TextureHandle,
 }
 
 pub struct Photo2CullApp {
     root: Option<PathBuf>,
-    mode: PhotoMode,
+    scan_mode: ScanMode,
     entries: Vec<PhotoEntry>,
     errors: Vec<(PathBuf, String)>,
     total_found: usize,
@@ -29,7 +30,7 @@ impl Photo2CullApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self {
             root: None,
-            mode: PhotoMode::Landscape,
+            scan_mode: ScanMode::Auto,
             entries: Vec::new(),
             errors: Vec::new(),
             total_found: 0,
@@ -50,8 +51,8 @@ impl Photo2CullApp {
 
         let (tx, rx) = channel();
         self.rx = Some(rx);
-        let mode = self.mode;
-        thread::spawn(move || run_scan(root, mode, tx));
+        let scan_mode = self.scan_mode;
+        thread::spawn(move || run_scan(root, scan_mode, tx));
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
@@ -71,6 +72,7 @@ impl Photo2CullApp {
                     );
                     self.entries.push(PhotoEntry {
                         path: p.path,
+                        mode: p.mode,
                         score: p.score,
                         texture,
                     });
@@ -128,10 +130,18 @@ impl eframe::App for Photo2CullApp {
                 ui.separator();
 
                 egui::ComboBox::from_label("Mode")
-                    .selected_text(self.mode.label())
+                    .selected_text(match self.scan_mode {
+                        ScanMode::Auto => "Auto".to_string(),
+                        ScanMode::Fixed(m) => m.label().to_string(),
+                    })
                     .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.scan_mode, ScanMode::Auto, "Auto");
                         for m in PhotoMode::ALL {
-                            ui.selectable_value(&mut self.mode, m, m.label());
+                            ui.selectable_value(
+                                &mut self.scan_mode,
+                                ScanMode::Fixed(m),
+                                m.label(),
+                            );
                         }
                     });
 
@@ -201,7 +211,10 @@ impl eframe::App for Photo2CullApp {
                                 } else {
                                     ui.label(name);
                                 }
-                                ui.label(format!("score: {:.0}", entry.score));
+                                ui.horizontal(|ui| {
+                                    ui.small(entry.mode.label());
+                                    ui.label(format!("score: {:.0}", entry.score));
+                                });
                             });
                         });
                     }
