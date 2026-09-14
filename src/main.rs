@@ -1,9 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod raw;
-mod scan;
-mod sharpness;
+use photo2cull::app;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {

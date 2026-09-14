@@ -1,6 +1,9 @@
 use std::path::Path;
 
+use anyhow::Context;
 use image::RgbImage;
+use rawler::decoders::RawDecodeParams;
+use rawler::rawsource::RawSource;
 
 /// File extensions treated as RAW photos. Matched case-insensitively.
 pub const RAW_EXTENSIONS: &[&str] = &[
@@ -18,12 +21,33 @@ pub fn is_raw_file(path: &Path) -> bool {
 
 /// Decode a RAW file to RGB8, downsized so neither edge exceeds `max_dim`.
 ///
-/// Decoding at a capped resolution (rather than full sensor resolution,
-/// often 40-100MP) is what keeps scanning thousands of files fast; sharpness
-/// scoring doesn't need full resolution to be meaningful.
+/// Rather than demosaicing the sensor's CFA data ourselves, this extracts
+/// the camera's embedded preview JPEG (every RAW file carries at least one,
+/// for the camera's own rear-LCD display and for fast previews in other
+/// tools). That sidesteps needing per-camera demosaic/calibration support
+/// for sharpness scoring, which matters because that database lags real
+/// camera releases by years (e.g. it lacked the Fujifilm X-T3 entirely) --
+/// embedded-preview extraction only needs to recognize the container
+/// format, not calibrate the sensor.
 pub fn decode_raw(path: &Path, max_dim: usize) -> anyhow::Result<RgbImage> {
-    let out = imagepipe::simple_decode_8bit(path, max_dim, max_dim)
-        .map_err(|e| anyhow::anyhow!("failed to decode {}: {e}", path.display()))?;
-    RgbImage::from_raw(out.width as u32, out.height as u32, out.data)
-        .ok_or_else(|| anyhow::anyhow!("decoded buffer size mismatch for {}", path.display()))
+    let source =
+        RawSource::new(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let decoder = rawler::get_decoder(&source)
+        .map_err(|e| anyhow::anyhow!("unsupported RAW file {}: {e}", path.display()))?;
+    let params = RawDecodeParams::default();
+
+    let dynamic = decoder
+        .full_image(&source, &params)
+        .ok()
+        .flatten()
+        .or_else(|| decoder.preview_image(&source, &params).ok().flatten())
+        .or_else(|| decoder.thumbnail_image(&source, &params).ok().flatten())
+        .ok_or_else(|| anyhow::anyhow!("no usable preview found in {}", path.display()))?;
+
+    let resized = dynamic.resize(
+        max_dim as u32,
+        max_dim as u32,
+        image::imageops::FilterType::Triangle,
+    );
+    Ok(resized.to_rgb8())
 }
