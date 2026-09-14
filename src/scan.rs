@@ -45,14 +45,16 @@ pub fn run_scan(root: PathBuf, mode: PhotoMode, tx: Sender<ScanEvent>) {
         match decode_raw(path, SCORE_MAX_DIM) {
             Ok(img) => {
                 let s = score(&img, mode);
-                // `imageops::thumbnail` stretches to the exact box regardless of aspect
-                // ratio; `resize` fits within it, preserving the photo's proportions.
-                let thumb = image::imageops::resize(
-                    &img,
-                    THUMB_MAX_DIM,
-                    THUMB_MAX_DIM,
-                    image::imageops::FilterType::Triangle,
-                );
+                // The `imageops::resize`/`thumbnail` free functions both stretch to the
+                // exact box regardless of aspect ratio. `DynamicImage::resize` (the
+                // method) is the one that fits within the box, preserving proportions.
+                let thumb = image::DynamicImage::ImageRgb8(img.clone())
+                    .resize(
+                        THUMB_MAX_DIM,
+                        THUMB_MAX_DIM,
+                        image::imageops::FilterType::Triangle,
+                    )
+                    .to_rgb8();
                 let _ = tx.send(ScanEvent::Photo(PhotoResult {
                     path: path.clone(),
                     score: s,
