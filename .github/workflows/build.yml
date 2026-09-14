@@ -1,0 +1,60 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-apple-silicon
+            os: macos-14
+            target: aarch64-apple-darwin
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux GUI build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev libxext-dev \
+            libgl1-mesa-dev libvulkan1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check
+        run: cargo check --target ${{ matrix.target }}
+
+      - name: Test
+        run: cargo test --target ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: photo2cull-${{ matrix.name }}
+          path: |
+            target/${{ matrix.target }}/release/photo2cull
+            target/${{ matrix.target }}/release/photo2cull.exe
+            target/${{ matrix.target }}/release/photo2cull.app
+          if-no-files-found: ignore
