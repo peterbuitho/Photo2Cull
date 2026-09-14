@@ -188,6 +188,18 @@ pub fn detect_faces(rgb: &RgbImage) -> Vec<FaceBox> {
         .collect()
 }
 
+/// Convenience wrapper around [`detect_faces`] for callers that just want
+/// "the" subject face, if any -- the largest detection by area, on the
+/// assumption that the main subject of a portrait is usually the most
+/// prominent face in frame.
+pub fn detect_main_face(rgb: &RgbImage) -> Option<FaceBox> {
+    detect_faces(rgb).into_iter().max_by(|a, b| {
+        let area_a = (a.x2 - a.x1) * (a.y2 - a.y1);
+        let area_b = (b.x2 - b.x1) * (b.y2 - b.y1);
+        area_a.partial_cmp(&area_b).unwrap()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

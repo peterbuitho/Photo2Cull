@@ -3,7 +3,7 @@ use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use photo2cull::classify::detect_faces;
+use photo2cull::classify::detect_main_face;
 use photo2cull::raw::{decode_raw, is_raw_file};
 use photo2cull::sharpness::{guess_landscape_or_object, score, PhotoMode};
 
@@ -21,11 +21,7 @@ fn main() {
         let start = Instant::now();
         match decode_raw(&path, 1600) {
             Ok(img) => {
-                let best_face = detect_faces(&img).into_iter().max_by(|a, b| {
-                    let area_a = (a.x2 - a.x1) * (a.y2 - a.y1);
-                    let area_b = (b.x2 - b.x1) * (b.y2 - b.y1);
-                    area_a.partial_cmp(&area_b).unwrap()
-                });
+                let best_face = detect_main_face(&img);
                 let mode = match &best_face {
                     Some(_) => PhotoMode::Portrait,
                     None => guess_landscape_or_object(&img),

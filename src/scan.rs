@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 use std::sync::mpsc::Sender;
 
+use image::RgbImage;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 
-use crate::classify::detect_faces;
+use crate::classify::detect_main_face;
 use crate::raw::{decode_raw, is_raw_file};
 use crate::sharpness::{guess_landscape_or_object, score, PhotoMode};
 
@@ -14,15 +15,37 @@ const SCORE_MAX_DIM: usize = 1600;
 /// Cap for the preview thumbnail shown in the UI.
 const THUMB_MAX_DIM: u32 = 220;
 
-/// What sharpness-scoring mode to use for each photo in a scan.
+/// What sharpness-scoring mode to use for a photo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanMode {
     /// Classify each photo individually (face detection for Portrait,
     /// falling back to a sharpness-uniformity heuristic for Landscape vs
     /// Object).
     Auto,
-    /// Force every photo in the scan to the same mode.
+    /// Force this mode. Portrait still tries face detection (for a tighter,
+    /// more accurate scoring region) and falls back to a centered crop if
+    /// no face is found.
     Fixed(PhotoMode),
+}
+
+/// Classify (if `Auto`) and score a single already-decoded photo.
+fn classify_and_score(img: &RgbImage, scan_mode: ScanMode) -> (PhotoMode, f64) {
+    let (mode, face) = match scan_mode {
+        ScanMode::Auto => match detect_main_face(img) {
+            Some(f) => (PhotoMode::Portrait, Some(f)),
+            None => (guess_landscape_or_object(img), None),
+        },
+        ScanMode::Fixed(m) => {
+            let face = if m == PhotoMode::Portrait {
+                detect_main_face(img)
+            } else {
+                None
+            };
+            (m, face)
+        }
+    };
+    let s = score(img, mode, face.as_ref());
+    (mode, s)
 }
 
 pub struct PhotoResult {
@@ -57,21 +80,7 @@ pub fn run_scan(root: PathBuf, scan_mode: ScanMode, tx: Sender<ScanEvent>) {
     files.par_iter().for_each_with(tx.clone(), |tx, path| {
         match decode_raw(path, SCORE_MAX_DIM) {
             Ok(img) => {
-                let (mode, face) = match scan_mode {
-                    ScanMode::Fixed(m) => (m, None),
-                    ScanMode::Auto => {
-                        let best_face = detect_faces(&img).into_iter().max_by(|a, b| {
-                            let area_a = (a.x2 - a.x1) * (a.y2 - a.y1);
-                            let area_b = (b.x2 - b.x1) * (b.y2 - b.y1);
-                            area_a.partial_cmp(&area_b).unwrap()
-                        });
-                        match best_face {
-                            Some(f) => (PhotoMode::Portrait, Some(f)),
-                            None => (guess_landscape_or_object(&img), None),
-                        }
-                    }
-                };
-                let s = score(&img, mode, face.as_ref());
+                let (mode, s) = classify_and_score(&img, scan_mode);
                 // `DynamicImage::resize` (the method) fits within the box,
                 // preserving aspect ratio; the free functions
                 // `imageops::resize`/`thumbnail` both stretch to it exactly.
@@ -98,4 +107,30 @@ pub fn run_scan(root: PathBuf, scan_mode: ScanMode, tx: Sender<ScanEvent>) {
     });
 
     let _ = tx.send(ScanEvent::Done);
+}
+
+pub struct RecomputeResult {
+    pub path: PathBuf,
+    pub score: f64,
+}
+
+pub enum RecomputeEvent {
+    Result(RecomputeResult),
+    Done,
+}
+
+/// Re-scores specific (path, forced mode) pairs -- used after the user
+/// manually overrides a photo's type -- without re-walking the folder or
+/// regenerating thumbnails (the crop used for those doesn't depend on mode).
+pub fn run_recompute(items: Vec<(PathBuf, PhotoMode)>, tx: Sender<RecomputeEvent>) {
+    items.par_iter().for_each_with(tx.clone(), |tx, (path, mode)| {
+        if let Ok(img) = decode_raw(path, SCORE_MAX_DIM) {
+            let (_, s) = classify_and_score(&img, ScanMode::Fixed(*mode));
+            let _ = tx.send(RecomputeEvent::Result(RecomputeResult {
+                path: path.clone(),
+                score: s,
+            }));
+        }
+    });
+    let _ = tx.send(RecomputeEvent::Done);
 }
