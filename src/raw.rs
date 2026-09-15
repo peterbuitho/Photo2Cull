@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::Context;
-use image::RgbImage;
+use image::{DynamicImage, RgbImage};
 use rawler::decoders::RawDecodeParams;
 use rawler::rawsource::RawSource;
 
@@ -44,10 +44,39 @@ pub fn decode_raw(path: &Path, max_dim: usize) -> anyhow::Result<RgbImage> {
         .or_else(|| decoder.thumbnail_image(&source, &params).ok().flatten())
         .ok_or_else(|| anyhow::anyhow!("no usable preview found in {}", path.display()))?;
 
+    // The embedded preview is stored in the sensor's native (landscape)
+    // orientation; a portrait shot needs the EXIF Orientation tag applied
+    // to come out upright. This matters beyond just display: face
+    // detection and the center-crop scoring regions both assume an
+    // upright image, so an un-rotated portrait would hurt both.
+    let orientation = decoder
+        .raw_metadata(&source, &params)
+        .ok()
+        .and_then(|m| m.exif.orientation);
+    let dynamic = apply_exif_orientation(dynamic, orientation);
+
     let resized = dynamic.resize(
         max_dim as u32,
         max_dim as u32,
         image::imageops::FilterType::Triangle,
     );
     Ok(resized.to_rgb8())
+}
+
+/// Rotate/flip `img` per the EXIF Orientation tag (values 1-8) so it comes
+/// out upright. Values 5 and 7 (mirrored + rotated) are vanishingly rare in
+/// real camera output -- effectively only ever produced by some scanning
+/// software -- so they're handled but not as rigorously verified as the
+/// plain-rotation cases (3/6/8), which dominate in practice.
+fn apply_exif_orientation(img: DynamicImage, orientation: Option<u16>) -> DynamicImage {
+    match orientation {
+        Some(2) => img.fliph(),
+        Some(3) => img.rotate180(),
+        Some(4) => img.flipv(),
+        Some(5) => img.fliph().rotate270(),
+        Some(6) => img.rotate90(),
+        Some(7) => img.fliph().rotate90(),
+        Some(8) => img.rotate270(),
+        _ => img,
+    }
 }
