@@ -41,6 +41,16 @@ enum PreviewEvent {
     },
 }
 
+/// Name of the subfolder (created inside the scanned root) that
+/// disqualified photos get moved into.
+const DISQUALIFIED_DIR: &str = "disqualified";
+
+enum MoveEvent {
+    Moved(PathBuf),
+    Failed(PathBuf, String),
+    Done,
+}
+
 pub struct Photo2CullApp {
     root: Option<PathBuf>,
     scan_mode: ScanMode,
@@ -55,6 +65,11 @@ pub struct Photo2CullApp {
     cull_percentile: f32,
     viewer: Option<Viewer>,
     preview_rx: Option<Receiver<PreviewEvent>>,
+    moving: bool,
+    move_rx: Option<Receiver<MoveEvent>>,
+    move_moved: usize,
+    move_failed: usize,
+    move_status: Option<String>,
 }
 
 impl Photo2CullApp {
@@ -73,6 +88,95 @@ impl Photo2CullApp {
             cull_percentile: 20.0,
             viewer: None,
             preview_rx: None,
+            moving: false,
+            move_rx: None,
+            move_moved: 0,
+            move_failed: 0,
+            move_status: None,
+        }
+    }
+
+    /// Move every currently-flagged (likely out of focus) photo into a
+    /// `disqualified` subfolder of the scanned root, in the background.
+    fn start_move_disqualified(&mut self) {
+        if self.moving {
+            return;
+        }
+        let Some(root) = self.root.clone() else { return };
+        let Some(cutoff) = self.cull_cutoff() else {
+            return;
+        };
+        let items: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|e| e.score <= cutoff)
+            .map(|e| e.path.clone())
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+
+        self.moving = true;
+        self.move_moved = 0;
+        self.move_failed = 0;
+        self.move_status = None;
+        let (tx, rx) = channel();
+        self.move_rx = Some(rx);
+        let dest_dir = root.join(DISQUALIFIED_DIR);
+        thread::spawn(move || {
+            if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+                for path in items {
+                    let _ = tx.send(MoveEvent::Failed(
+                        path,
+                        format!("couldn't create {}: {e}", dest_dir.display()),
+                    ));
+                }
+                let _ = tx.send(MoveEvent::Done);
+                return;
+            }
+            for path in items {
+                let result = match path.file_name() {
+                    Some(name) => std::fs::rename(&path, dest_dir.join(name)),
+                    None => Err(std::io::Error::other("photo path has no file name")),
+                };
+                let _ = tx.send(match result {
+                    Ok(()) => MoveEvent::Moved(path),
+                    Err(e) => MoveEvent::Failed(path, e.to_string()),
+                });
+            }
+            let _ = tx.send(MoveEvent::Done);
+        });
+    }
+
+    fn drain_move(&mut self) {
+        let Some(rx) = &self.move_rx else {
+            return;
+        };
+        let mut done = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                MoveEvent::Moved(path) => {
+                    self.entries.retain(|e| e.path != path);
+                    self.move_moved += 1;
+                }
+                MoveEvent::Failed(path, err) => {
+                    self.errors.push((path, err));
+                    self.move_failed += 1;
+                }
+                MoveEvent::Done => done = true,
+            }
+        }
+        if done {
+            self.moving = false;
+            self.move_rx = None;
+            self.move_status = Some(if self.move_failed > 0 {
+                format!(
+                    "Moved {} to {DISQUALIFIED_DIR}/, {} failed",
+                    self.move_moved, self.move_failed
+                )
+            } else {
+                format!("Moved {} to {DISQUALIFIED_DIR}/", self.move_moved)
+            });
         }
     }
 
@@ -291,7 +395,11 @@ impl eframe::App for Photo2CullApp {
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
         self.drain_preview(&ctx);
-        if self.scanning || self.recomputing || self.viewer.as_ref().is_some_and(|v| v.texture.is_none())
+        self.drain_move();
+        if self.scanning
+            || self.recomputing
+            || self.moving
+            || self.viewer.as_ref().is_some_and(|v| v.texture.is_none())
         {
             ctx.request_repaint();
         }
@@ -357,6 +465,12 @@ impl eframe::App for Photo2CullApp {
                 return;
             }
 
+            let cutoff = self.cull_cutoff();
+            let flagged_count = cutoff
+                .map(|c| self.entries.iter().filter(|e| e.score <= c).count())
+                .unwrap_or(0);
+            let dirty_count = self.entries.iter().filter(|e| e.dirty).count();
+
             ui.horizontal(|ui| {
                 ui.label("Flag bottom");
                 ui.add(
@@ -368,7 +482,6 @@ impl eframe::App for Photo2CullApp {
 
                 ui.separator();
 
-                let dirty_count = self.entries.iter().filter(|e| e.dirty).count();
                 if ui
                     .add_enabled(
                         dirty_count > 0 && !self.recomputing,
@@ -386,13 +499,36 @@ impl eframe::App for Photo2CullApp {
                         if dirty_count == 1 { "" } else { "s" }
                     ));
                 }
+
+                ui.separator();
+
+                let can_move = flagged_count > 0
+                    && dirty_count == 0
+                    && !self.moving
+                    && !self.scanning
+                    && !self.recomputing;
+                if ui
+                    .add_enabled(
+                        can_move,
+                        egui::Button::new(format!("Move {flagged_count} disqualified")),
+                    )
+                    .clicked()
+                {
+                    self.start_move_disqualified();
+                }
+                if self.moving {
+                    ui.spinner();
+                } else if let Some(status) = &self.move_status {
+                    ui.label(status);
+                } else if dirty_count > 0 && flagged_count > 0 {
+                    ui.label("recalculate pending changes first");
+                }
             });
             if !self.errors.is_empty() {
                 ui.label(format!("{} files failed to decode", self.errors.len()));
             }
             ui.separator();
 
-            let cutoff = self.cull_cutoff();
             let mut order: Vec<usize> = (0..self.entries.len()).collect();
             order.sort_by(|&a, &b| {
                 self.entries[a]
