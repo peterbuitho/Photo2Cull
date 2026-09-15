@@ -15,6 +15,11 @@ const SCORE_MAX_DIM: usize = 1600;
 /// Cap for the preview thumbnail shown in the UI.
 const THUMB_MAX_DIM: u32 = 220;
 
+/// Name of the subfolder (created inside the scanned root) that
+/// disqualified photos get moved into. Scans skip it entirely, so a photo
+/// moved there doesn't reappear (flagged all over again) on the next scan.
+pub const DISQUALIFIED_DIR: &str = "disqualified";
+
 /// What sharpness-scoring mode to use for a photo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanMode {
@@ -71,6 +76,9 @@ pub enum ScanEvent {
 pub fn run_scan(root: PathBuf, scan_mode: ScanMode, tx: Sender<ScanEvent>) {
     let files: Vec<PathBuf> = WalkDir::new(&root)
         .into_iter()
+        .filter_entry(|e| {
+            !(e.file_type().is_dir() && e.file_name().to_str() == Some(DISQUALIFIED_DIR))
+        })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file() && is_supported_photo(e.path()))
         .map(|e| e.path().to_path_buf())

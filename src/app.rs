@@ -4,7 +4,7 @@ use std::thread;
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
 
-use crate::scan::{RecomputeEvent, ScanEvent, ScanMode, run_recompute, run_scan};
+use crate::scan::{DISQUALIFIED_DIR, RecomputeEvent, ScanEvent, ScanMode, run_recompute, run_scan};
 use crate::sharpness::PhotoMode;
 
 struct PhotoEntry {
@@ -40,10 +40,6 @@ enum PreviewEvent {
         path: PathBuf,
     },
 }
-
-/// Name of the subfolder (created inside the scanned root) that
-/// disqualified photos get moved into.
-const DISQUALIFIED_DIR: &str = "disqualified";
 
 enum MoveEvent {
     Moved(PathBuf),
