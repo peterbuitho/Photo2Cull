@@ -28,8 +28,14 @@ const CENTER_VARIANCE: f32 = 0.1;
 const SIZE_VARIANCE: f32 = 0.2;
 /// Ignore detections smaller than this fraction of the frame area: a tiny
 /// face in the background shouldn't turn an otherwise-landscape shot into
-/// a "Portrait".
-const MIN_FACE_AREA_FRACTION: f32 = 0.02;
+/// a "Portrait". Kept deliberately low -- real environmental portraits
+/// (subject not tightly cropped) can have the face at well under 1% of
+/// frame area while still clearly being the intended subject; verified
+/// against real photos with a 99%+ confidence face at 0.6-1.4% area that
+/// an earlier, stricter 2% cutoff was wrongly rejecting. The confidence
+/// threshold above does most of the real discriminating work (background
+/// faces in those same photos scored well under 0.5).
+const MIN_FACE_AREA_FRACTION: f32 = 0.001;
 
 /// A detected face, in pixel coordinates of the image it was detected in.
 #[derive(Debug, Clone, Copy)]
