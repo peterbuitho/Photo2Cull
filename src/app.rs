@@ -1,23 +1,41 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
 
+use crate::dedupe::group_duplicates;
 use crate::metrics::{overall_score, Metrics, Weights};
 use crate::scan::{DISQUALIFIED_DIR, RecomputeEvent, ScanEvent, ScanMode, run_recompute, run_scan};
 use crate::sharpness::PhotoMode;
+
+/// Width (excluding the group's frame/margin) of each photo card, shared by
+/// the flat grid and the duplicate-groups view.
+const CARD_WIDTH: f32 = 180.0;
 
 struct PhotoEntry {
     path: PathBuf,
     mode: PhotoMode,
     score: f64,
     metrics: Metrics,
+    /// Perceptual hash for duplicate/burst detection (see `dedupe`).
+    phash: u64,
     /// True if `mode` was changed (manually, or by a rescan) since `score`
     /// (and `metrics`) was last computed for it -- i.e. the values shown
     /// are stale.
     dirty: bool,
     texture: TextureHandle,
+}
+
+/// Which set of photos is shown in the central panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    /// Every scanned photo, in one sortable grid (the original view).
+    Flat,
+    /// Only photos belonging to a duplicate/burst group, one section per
+    /// group, from the last "Group duplicates" click.
+    Grouped,
 }
 
 /// Which score the grid is sorted (and, for `Overall`, flagged) by. The
@@ -82,6 +100,15 @@ pub struct Photo2CullApp {
     weights: Weights,
     sort_by: SortBy,
     show_weights: bool,
+    view_mode: ViewMode,
+    /// Duplicate/burst clusters (2+ members each) from the last "Group
+    /// duplicates" click; empty until then. Stored as paths rather than
+    /// entry indices so it stays valid (modulo dissolving groups down to
+    /// <2 present members) across moves, which is checked at render time.
+    groups: Vec<Vec<PathBuf>>,
+    /// Max dHash Hamming distance (0-64) for two photos to be considered
+    /// duplicates/burst-mates.
+    group_threshold: u32,
 }
 
 impl Photo2CullApp {
@@ -108,7 +135,19 @@ impl Photo2CullApp {
             weights: Weights::default(),
             sort_by: SortBy::Sharpness,
             show_weights: false,
+            view_mode: ViewMode::Flat,
+            groups: Vec::new(),
+            group_threshold: 6,
         }
+    }
+
+    /// Cluster the current entries into duplicate/burst groups by dHash
+    /// distance. Cheap enough (a single XOR+popcount per pair) to run
+    /// synchronously from a button click even for several thousand photos.
+    fn compute_groups(&mut self) {
+        let photos: Vec<(PathBuf, u64)> =
+            self.entries.iter().map(|e| (e.path.clone(), e.phash)).collect();
+        self.groups = group_duplicates(&photos, self.group_threshold);
     }
 
     /// Move every currently-flagged (likely out of focus) photo into a
@@ -263,6 +302,8 @@ impl Photo2CullApp {
         self.total_found = 0;
         self.processed = 0;
         self.scanning = true;
+        self.groups.clear();
+        self.view_mode = ViewMode::Flat;
 
         let (tx, rx) = channel();
         self.rx = Some(rx);
@@ -313,6 +354,7 @@ impl Photo2CullApp {
                             mode: p.mode,
                             score: p.score,
                             metrics: p.metrics,
+                            phash: p.phash,
                             dirty: false,
                             texture,
                         });
@@ -413,6 +455,151 @@ impl Photo2CullApp {
         let mut iter = self.entries.iter().map(|e| e.score);
         let first = iter.next()?;
         Some(iter.fold((first, first), |(lo, hi), s| (lo.min(s), hi.max(s))))
+    }
+
+    /// One photo card: thumbnail (double-click to open the full-size
+    /// preview), filename (red if `flagged`), the type dropdown, the
+    /// absolute sharpness score, and the Overall score. Shared by the flat
+    /// grid and the duplicate-groups view so they can't drift apart.
+    /// `badge`, if given, is drawn as a colored label under the filename
+    /// (e.g. marking the best-of-group pick).
+    fn photo_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        idx: usize,
+        flagged: bool,
+        badge: Option<(egui::Color32, &str)>,
+        open_request: &mut Option<PathBuf>,
+    ) {
+        ui.group(|ui| {
+            ui.set_width(CARD_WIDTH);
+            ui.vertical(|ui| {
+                let entry = &self.entries[idx];
+                let size = entry.texture.size_vec2();
+                let max_dim = 160.0_f32;
+                let scale = (max_dim / size.x.max(size.y)).min(1.0);
+                let image_response = ui
+                    .image((entry.texture.id(), size * scale))
+                    .interact(egui::Sense::click());
+                if image_response.double_clicked() {
+                    *open_request = Some(entry.path.clone());
+                }
+                let name = entry
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if flagged {
+                    ui.colored_label(egui::Color32::from_rgb(220, 90, 90), name);
+                } else {
+                    ui.label(name);
+                }
+                if let Some((color, text)) = badge {
+                    ui.colored_label(color, text);
+                }
+
+                ui.horizontal(|ui| {
+                    let mut mode = self.entries[idx].mode;
+                    egui::ComboBox::from_id_salt(("photo-mode", idx))
+                        .selected_text(mode.label())
+                        .width(88.0)
+                        .show_ui(ui, |ui| {
+                            for m in PhotoMode::ALL {
+                                ui.selectable_value(&mut mode, m, m.label());
+                            }
+                        });
+                    if mode != self.entries[idx].mode {
+                        self.entries[idx].mode = mode;
+                        self.entries[idx].dirty = true;
+                    }
+
+                    let entry = &self.entries[idx];
+                    if entry.dirty {
+                        ui.colored_label(egui::Color32::from_rgb(200, 150, 60), "score: pending…");
+                    } else {
+                        ui.label(format!("score: {:.0}", entry.score));
+                    }
+                });
+                if !self.entries[idx].dirty {
+                    let overall = overall_score(&self.entries[idx].metrics, &self.weights);
+                    ui.small(format!("overall: {overall:.0}"));
+                }
+            });
+        });
+    }
+
+    /// Lay `indices` out as chunked (non-wrapping) rows of `photo_card`s --
+    /// see the note on `horizontal_wrapped` corruption where this pattern
+    /// is used in the flat grid for why it's not just `horizontal_wrapped`.
+    /// `cutoff`, if given, flags (red name) entries scoring at or below it
+    /// -- used by the flat grid, not the groups view. `best_idx`, if given,
+    /// badges that one entry -- used by the groups view, not the flat grid.
+    fn photo_row_grid(
+        &mut self,
+        ui: &mut egui::Ui,
+        indices: &[usize],
+        cutoff: Option<f64>,
+        best_idx: Option<usize>,
+        open_request: &mut Option<PathBuf>,
+    ) {
+        let spacing = ui.spacing().item_spacing.x;
+        let columns = ((ui.available_width() / (CARD_WIDTH + spacing)).floor() as usize).max(1);
+        for row in indices.chunks(columns) {
+            ui.horizontal(|ui| {
+                for &idx in row {
+                    let flagged = cutoff.map(|c| self.entries[idx].score <= c).unwrap_or(false);
+                    let badge = (Some(idx) == best_idx)
+                        .then_some((egui::Color32::from_rgb(90, 170, 90), "★ best of group"));
+                    self.photo_card(ui, idx, flagged, badge, open_request);
+                }
+            });
+        }
+    }
+
+    /// The duplicate/burst groups view: one section per cluster from the
+    /// last "Group duplicates" click, each showing its members with the
+    /// highest-Overall pick badged. Groups that have dissolved to fewer
+    /// than 2 still-present members (e.g. after a move) are skipped.
+    fn render_groups(&mut self, ui: &mut egui::Ui, open_request: &mut Option<PathBuf>) {
+        if self.groups.is_empty() {
+            ui.label(
+                "No duplicate/burst groups yet -- set a threshold and click \"Group duplicates\".",
+            );
+            return;
+        }
+
+        let path_to_idx: HashMap<PathBuf, usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.path.clone(), i))
+            .collect();
+        let groups = self.groups.clone();
+        let weights = self.weights;
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                for (gi, group) in groups.iter().enumerate() {
+                    let indices: Vec<usize> = group
+                        .iter()
+                        .filter_map(|p| path_to_idx.get(p).copied())
+                        .collect();
+                    if indices.len() < 2 {
+                        continue;
+                    }
+
+                    let best_idx = indices.iter().copied().max_by(|&a, &b| {
+                        overall_score(&self.entries[a].metrics, &weights)
+                            .partial_cmp(&overall_score(&self.entries[b].metrics, &weights))
+                            .unwrap()
+                    });
+
+                    ui.label(format!("Group {} ({} photos)", gi + 1, indices.len()));
+                    self.photo_row_grid(ui, &indices, None, best_idx, open_request);
+                    ui.separator();
+                }
+            });
     }
 }
 
@@ -566,6 +753,47 @@ impl eframe::App for Photo2CullApp {
                 ui.checkbox(&mut self.show_weights, "Weights");
             });
 
+            ui.horizontal(|ui| {
+                ui.label("Duplicate/burst threshold");
+                ui.add(
+                    egui::DragValue::new(&mut self.group_threshold)
+                        .speed(1)
+                        .range(0..=64),
+                );
+                ui.small("(max hash distance, 0-64; lower = stricter)");
+
+                ui.separator();
+
+                let can_group = !self.entries.is_empty() && !self.scanning;
+                if ui
+                    .add_enabled(can_group, egui::Button::new("Group duplicates"))
+                    .clicked()
+                {
+                    self.compute_groups();
+                    self.view_mode = ViewMode::Grouped;
+                }
+                if !self.groups.is_empty() {
+                    let grouped: usize = self.groups.iter().map(|g| g.len()).sum();
+                    ui.label(format!("{} groups ({grouped} photos)", self.groups.len()));
+                }
+
+                ui.separator();
+
+                egui::ComboBox::from_id_salt("view-mode")
+                    .selected_text(match self.view_mode {
+                        ViewMode::Flat => "All photos",
+                        ViewMode::Grouped => "Duplicate groups",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.view_mode, ViewMode::Flat, "All photos");
+                        ui.selectable_value(
+                            &mut self.view_mode,
+                            ViewMode::Grouped,
+                            "Duplicate groups",
+                        );
+                    });
+            });
+
             if self.show_weights {
                 ui.group(|ui| {
                     ui.label(
@@ -612,117 +840,41 @@ impl eframe::App for Photo2CullApp {
             }
             ui.separator();
 
-            let mut order: Vec<usize> = (0..self.entries.len()).collect();
-            match self.sort_by {
-                SortBy::Sharpness => order.sort_by(|&a, &b| {
-                    self.entries[a]
-                        .score
-                        .partial_cmp(&self.entries[b].score)
-                        .unwrap()
-                }),
-                SortBy::Overall => order.sort_by(|&a, &b| {
-                    let oa = overall_score(&self.entries[a].metrics, &self.weights);
-                    let ob = overall_score(&self.entries[b].metrics, &self.weights);
-                    // Higher Overall first -- unlike Sharpness, where worst-first
-                    // matches "what should I cull", Overall is "what's best".
-                    ob.partial_cmp(&oa).unwrap()
-                }),
-            }
-
             let mut open_request: Option<PathBuf> = None;
 
-            const CARD_WIDTH: f32 = 180.0;
-
-            // `auto_shrink` defaults to [true, true], meaning the area
-            // shrinks its *width* to fit its content -- pin it to the
-            // panel's, leaving only the vertical axis auto-sized.
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    // `horizontal_wrapped` (egui 0.36.2) corrupts its row-height
-                    // tracking once it wraps, if the wrapped items contain a
-                    // nested child Ui (ui.group/ui.vertical/etc, as our cards
-                    // do) -- every row after the first balloons in height
-                    // instead of the layout starting a new one. Chunking into
-                    // plain (non-wrapping) horizontal rows ourselves sidesteps
-                    // that entirely and is a standard pattern for this anyway.
-                    let spacing = ui.spacing().item_spacing.x;
-                    let columns = ((ui.available_width() / (CARD_WIDTH + spacing)).floor()
-                        as usize)
-                        .max(1);
-
-                    for row in order.chunks(columns) {
-                        ui.horizontal(|ui| {
-                            for &idx in row {
-                                let flagged =
-                                    cutoff.map(|c| self.entries[idx].score <= c).unwrap_or(false);
-                                ui.group(|ui| {
-                                    ui.set_width(CARD_WIDTH);
-                                    ui.vertical(|ui| {
-                                        let entry = &self.entries[idx];
-                                        let size = entry.texture.size_vec2();
-                                        let max_dim = 160.0_f32;
-                                        let scale = (max_dim / size.x.max(size.y)).min(1.0);
-                                        let image_response = ui
-                                            .image((entry.texture.id(), size * scale))
-                                            .interact(egui::Sense::click());
-                                        if image_response.double_clicked() {
-                                            open_request = Some(entry.path.clone());
-                                        }
-                                        let name = entry
-                                            .path
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().to_string())
-                                            .unwrap_or_default();
-                                        if flagged {
-                                            ui.colored_label(
-                                                egui::Color32::from_rgb(220, 90, 90),
-                                                name,
-                                            );
-                                        } else {
-                                            ui.label(name);
-                                        }
-
-                                        ui.horizontal(|ui| {
-                                            let mut mode = self.entries[idx].mode;
-                                            egui::ComboBox::from_id_salt(("photo-mode", idx))
-                                                .selected_text(mode.label())
-                                                .width(88.0)
-                                                .show_ui(ui, |ui| {
-                                                    for m in PhotoMode::ALL {
-                                                        ui.selectable_value(
-                                                            &mut mode,
-                                                            m,
-                                                            m.label(),
-                                                        );
-                                                    }
-                                                });
-                                            if mode != self.entries[idx].mode {
-                                                self.entries[idx].mode = mode;
-                                                self.entries[idx].dirty = true;
-                                            }
-
-                                            let entry = &self.entries[idx];
-                                            if entry.dirty {
-                                                ui.colored_label(
-                                                    egui::Color32::from_rgb(200, 150, 60),
-                                                    "score: pending…",
-                                                );
-                                            } else {
-                                                ui.label(format!("score: {:.0}", entry.score));
-                                            }
-                                        });
-                                        if !self.entries[idx].dirty {
-                                            let overall =
-                                                overall_score(&self.entries[idx].metrics, &self.weights);
-                                            ui.small(format!("overall: {overall:.0}"));
-                                        }
-                                    });
-                                });
-                            }
-                        });
+            match self.view_mode {
+                ViewMode::Flat => {
+                    let mut order: Vec<usize> = (0..self.entries.len()).collect();
+                    match self.sort_by {
+                        SortBy::Sharpness => order.sort_by(|&a, &b| {
+                            self.entries[a]
+                                .score
+                                .partial_cmp(&self.entries[b].score)
+                                .unwrap()
+                        }),
+                        SortBy::Overall => order.sort_by(|&a, &b| {
+                            let oa = overall_score(&self.entries[a].metrics, &self.weights);
+                            let ob = overall_score(&self.entries[b].metrics, &self.weights);
+                            // Higher Overall first -- unlike Sharpness, where
+                            // worst-first matches "what should I cull", Overall
+                            // is "what's best".
+                            ob.partial_cmp(&oa).unwrap()
+                        }),
                     }
-                });
+
+                    // `auto_shrink` defaults to [true, true], meaning the area
+                    // shrinks its *width* to fit its content -- pin it to the
+                    // panel's, leaving only the vertical axis auto-sized.
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            self.photo_row_grid(ui, &order, cutoff, None, &mut open_request);
+                        });
+                }
+                ViewMode::Grouped => {
+                    self.render_groups(ui, &mut open_request);
+                }
+            }
 
             if let Some(path) = open_request {
                 self.start_preview_load(path);

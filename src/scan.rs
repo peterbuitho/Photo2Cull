@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::classify::detect_main_face;
+use crate::dedupe::dhash;
 use crate::metrics::{self, Metrics};
 use crate::photo::{decode_photo, is_supported_photo};
 use crate::sharpness::{guess_landscape_or_object, score, PhotoMode};
@@ -63,6 +64,8 @@ pub struct PhotoResult {
     pub mode: PhotoMode,
     pub score: f64,
     pub metrics: Metrics,
+    /// Perceptual hash for duplicate/burst detection (see `dedupe`).
+    pub phash: u64,
     pub thumb_w: u32,
     pub thumb_h: u32,
     pub thumb_rgb: Vec<u8>,
@@ -96,6 +99,7 @@ pub fn run_scan(root: PathBuf, scan_mode: ScanMode, tx: Sender<ScanEvent>) {
         match decode_photo(path, SCORE_MAX_DIM) {
             Ok(img) => {
                 let (mode, s, metrics) = classify_and_score(&img, scan_mode);
+                let phash = dhash(&img);
                 // `DynamicImage::resize` (the method) fits within the box,
                 // preserving aspect ratio; the free functions
                 // `imageops::resize`/`thumbnail` both stretch to it exactly.
@@ -111,6 +115,7 @@ pub fn run_scan(root: PathBuf, scan_mode: ScanMode, tx: Sender<ScanEvent>) {
                     mode,
                     score: s,
                     metrics,
+                    phash,
                     thumb_w: thumb.width(),
                     thumb_h: thumb.height(),
                     thumb_rgb: thumb.into_raw(),
