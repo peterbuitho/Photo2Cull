@@ -85,7 +85,7 @@ impl Photo2CullApp {
             rx: None,
             recompute_rx: None,
             recomputing: false,
-            cull_threshold: 0.0,
+            cull_threshold: 40.0,
             viewer: None,
             preview_rx: None,
             moving: false,
