@@ -62,7 +62,7 @@ pub struct Photo2CullApp {
     rx: Option<Receiver<ScanEvent>>,
     recompute_rx: Option<Receiver<RecomputeEvent>>,
     recomputing: bool,
-    cull_percentile: f32,
+    cull_threshold: f64,
     viewer: Option<Viewer>,
     preview_rx: Option<Receiver<PreviewEvent>>,
     moving: bool,
@@ -85,7 +85,7 @@ impl Photo2CullApp {
             rx: None,
             recompute_rx: None,
             recomputing: false,
-            cull_percentile: 20.0,
+            cull_threshold: 0.0,
             viewer: None,
             preview_rx: None,
             moving: false,
@@ -377,16 +377,21 @@ impl Photo2CullApp {
         }
     }
 
-    /// Score below which entries are flagged, given the current percentile.
+    /// Score below which entries are flagged. `None` while there's nothing
+    /// scanned yet, so nothing shows as flagged before there's data.
     fn cull_cutoff(&self) -> Option<f64> {
         if self.entries.is_empty() {
-            return None;
+            None
+        } else {
+            Some(self.cull_threshold)
         }
-        let mut scores: Vec<f64> = self.entries.iter().map(|e| e.score).collect();
-        scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let idx = ((self.cull_percentile / 100.0) * scores.len() as f32).round() as usize;
-        let idx = idx.min(scores.len() - 1);
-        Some(scores[idx])
+    }
+
+    /// (min, max) score across all entries, for the threshold input's hint.
+    fn score_range(&self) -> Option<(f64, f64)> {
+        let mut iter = self.entries.iter().map(|e| e.score);
+        let first = iter.next()?;
+        Some(iter.fold((first, first), |(lo, hi), s| (lo.min(s), hi.max(s))))
     }
 }
 
@@ -472,13 +477,15 @@ impl eframe::App for Photo2CullApp {
             let dirty_count = self.entries.iter().filter(|e| e.dirty).count();
 
             ui.horizontal(|ui| {
-                ui.label("Flag bottom");
+                ui.label("Disqualify scores below");
                 ui.add(
-                    egui::Slider::new(&mut self.cull_percentile, 0.0..=100.0)
-                        .suffix("%")
-                        .fixed_decimals(0),
+                    egui::DragValue::new(&mut self.cull_threshold)
+                        .speed(1.0)
+                        .range(0.0..=f64::MAX),
                 );
-                ui.label("as likely out of focus");
+                if let Some((min, max)) = self.score_range() {
+                    ui.label(format!("(scanned scores range {min:.0}–{max:.0})"));
+                }
 
                 ui.separator();
 
