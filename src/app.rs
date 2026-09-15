@@ -189,7 +189,7 @@ impl Photo2CullApp {
         let (tx, rx) = channel();
         self.preview_rx = Some(rx);
         thread::spawn(move || {
-            let event = match crate::raw::decode_raw(&path, PREVIEW_MAX_DIM) {
+            let event = match crate::photo::decode_photo(&path, PREVIEW_MAX_DIM) {
                 Ok(img) => PreviewEvent::Loaded {
                     path,
                     w: img.width(),
@@ -462,7 +462,7 @@ impl eframe::App for Photo2CullApp {
         egui::CentralPanel::default().show(ui, |ui| {
             if self.entries.is_empty() {
                 ui.label(
-                    "Pick a folder and click Scan to check focus sharpness across your RAW files.",
+                    "Pick a folder and click Scan to check focus sharpness across your photos (RAW, PNG, JPG, TIFF, BMP, WebP).",
                 );
                 if !self.errors.is_empty() {
                     ui.label(format!("{} files failed to decode", self.errors.len()));

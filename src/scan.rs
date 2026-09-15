@@ -6,7 +6,7 @@ use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::classify::detect_main_face;
-use crate::raw::{decode_raw, is_raw_file};
+use crate::photo::{decode_photo, is_supported_photo};
 use crate::sharpness::{guess_landscape_or_object, score, PhotoMode};
 
 /// Resolution cap for decoding: enough detail for a meaningful sharpness
@@ -64,21 +64,22 @@ pub enum ScanEvent {
     Done,
 }
 
-/// Walks `root` for RAW files and scores each in parallel, streaming results
-/// back over `tx` as they complete. Intended to run on its own thread so the
-/// UI thread stays responsive; call from a `std::thread::spawn`.
+/// Walks `root` for supported photos (RAW or standard formats) and scores
+/// each in parallel, streaming results back over `tx` as they complete.
+/// Intended to run on its own thread so the UI thread stays responsive;
+/// call from a `std::thread::spawn`.
 pub fn run_scan(root: PathBuf, scan_mode: ScanMode, tx: Sender<ScanEvent>) {
     let files: Vec<PathBuf> = WalkDir::new(&root)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file() && is_raw_file(e.path()))
+        .filter(|e| e.file_type().is_file() && is_supported_photo(e.path()))
         .map(|e| e.path().to_path_buf())
         .collect();
 
     let _ = tx.send(ScanEvent::Found(files.len()));
 
     files.par_iter().for_each_with(tx.clone(), |tx, path| {
-        match decode_raw(path, SCORE_MAX_DIM) {
+        match decode_photo(path, SCORE_MAX_DIM) {
             Ok(img) => {
                 let (mode, s) = classify_and_score(&img, scan_mode);
                 // `DynamicImage::resize` (the method) fits within the box,
@@ -124,7 +125,7 @@ pub enum RecomputeEvent {
 /// regenerating thumbnails (the crop used for those doesn't depend on mode).
 pub fn run_recompute(items: Vec<(PathBuf, PhotoMode)>, tx: Sender<RecomputeEvent>) {
     items.par_iter().for_each_with(tx.clone(), |tx, (path, mode)| {
-        if let Ok(img) = decode_raw(path, SCORE_MAX_DIM) {
+        if let Ok(img) = decode_photo(path, SCORE_MAX_DIM) {
             let (_, s) = classify_and_score(&img, ScanMode::Fixed(*mode));
             let _ = tx.send(RecomputeEvent::Result(RecomputeResult {
                 path: path.clone(),

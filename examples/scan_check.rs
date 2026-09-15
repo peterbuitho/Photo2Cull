@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use photo2cull::classify::detect_main_face;
-use photo2cull::raw::{decode_raw, is_raw_file};
+use photo2cull::photo::{decode_photo, is_supported_photo};
 use photo2cull::sharpness::{guess_landscape_or_object, score, PhotoMode};
 
 fn main() {
@@ -13,13 +13,13 @@ fn main() {
         .expect("read_dir failed")
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| is_raw_file(p))
+        .filter(|p| is_supported_photo(p))
         .collect();
     files.sort();
 
     for path in files {
         let start = Instant::now();
-        match decode_raw(&path, 1600) {
+        match decode_photo(&path, 1600) {
             Ok(img) => {
                 let best_face = detect_main_face(&img);
                 let mode = match &best_face {
