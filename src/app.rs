@@ -36,6 +36,20 @@ enum ViewMode {
     /// Only photos belonging to a duplicate/burst group, one section per
     /// group, from the last "Group duplicates" click.
     Grouped,
+    /// The funnel result from the last "Run pipeline" click: technical
+    /// filter -> dedupe (best-of-group) -> rank by Overall -> top N.
+    Pipeline,
+}
+
+/// Result of running the full funnel (technical filter -> dedupe -> rank)
+/// down to a shortlist, from the last "Run pipeline" click.
+struct PipelineResult {
+    total: usize,
+    after_technical: usize,
+    after_dedupe: usize,
+    /// Entry indices, ranked by Overall score (best first), truncated to
+    /// the requested shortlist size.
+    shortlist: Vec<usize>,
 }
 
 /// Which score the grid is sorted (and, for `Overall`, flagged) by. The
@@ -109,6 +123,9 @@ pub struct Photo2CullApp {
     /// Max dHash Hamming distance (0-64) for two photos to be considered
     /// duplicates/burst-mates.
     group_threshold: u32,
+    /// How many photos the pipeline's final shortlist keeps.
+    pipeline_top_n: usize,
+    pipeline_result: Option<PipelineResult>,
 }
 
 impl Photo2CullApp {
@@ -138,6 +155,8 @@ impl Photo2CullApp {
             view_mode: ViewMode::Flat,
             groups: Vec::new(),
             group_threshold: 6,
+            pipeline_top_n: 150,
+            pipeline_result: None,
         }
     }
 
@@ -148,6 +167,63 @@ impl Photo2CullApp {
         let photos: Vec<(PathBuf, u64)> =
             self.entries.iter().map(|e| (e.path.clone(), e.phash)).collect();
         self.groups = group_duplicates(&photos, self.group_threshold);
+    }
+
+    /// The full funnel: drop photos at or below the sharpness cull
+    /// threshold, cluster survivors into duplicate/burst groups and keep
+    /// only the highest-Overall member of each (plus any ungrouped
+    /// singletons), then rank the rest by Overall and keep the top N.
+    /// Cheap enough (same cost as `compute_groups` plus a sort) to run
+    /// synchronously from a button click.
+    fn run_pipeline(&mut self) {
+        let total = self.entries.len();
+        let cutoff = self.cull_threshold;
+        let survivors: Vec<usize> =
+            (0..total).filter(|&i| self.entries[i].score > cutoff).collect();
+        let after_technical = survivors.len();
+
+        let photos: Vec<(PathBuf, u64)> = survivors
+            .iter()
+            .map(|&i| (self.entries[i].path.clone(), self.entries[i].phash))
+            .collect();
+        let groups = group_duplicates(&photos, self.group_threshold);
+
+        let path_to_idx: HashMap<PathBuf, usize> =
+            survivors.iter().map(|&i| (self.entries[i].path.clone(), i)).collect();
+        let grouped_paths: std::collections::HashSet<PathBuf> =
+            groups.iter().flatten().cloned().collect();
+
+        let mut keepers: Vec<usize> = Vec::new();
+        for group in &groups {
+            let best = group.iter().filter_map(|p| path_to_idx.get(p).copied()).max_by(
+                |&a, &b| {
+                    overall_score(&self.entries[a].metrics, &self.weights)
+                        .partial_cmp(&overall_score(&self.entries[b].metrics, &self.weights))
+                        .unwrap()
+                },
+            );
+            keepers.extend(best);
+        }
+        for &i in &survivors {
+            if !grouped_paths.contains(&self.entries[i].path) {
+                keepers.push(i);
+            }
+        }
+        let after_dedupe = keepers.len();
+
+        keepers.sort_by(|&a, &b| {
+            overall_score(&self.entries[b].metrics, &self.weights)
+                .partial_cmp(&overall_score(&self.entries[a].metrics, &self.weights))
+                .unwrap()
+        });
+        keepers.truncate(self.pipeline_top_n);
+
+        self.pipeline_result = Some(PipelineResult {
+            total,
+            after_technical,
+            after_dedupe,
+            shortlist: keepers,
+        });
     }
 
     /// Move every currently-flagged (likely out of focus) photo into a
@@ -303,6 +379,7 @@ impl Photo2CullApp {
         self.processed = 0;
         self.scanning = true;
         self.groups.clear();
+        self.pipeline_result = None;
         self.view_mode = ViewMode::Flat;
 
         let (tx, rx) = channel();
@@ -601,6 +678,33 @@ impl Photo2CullApp {
                 }
             });
     }
+
+    /// The pipeline shortlist view: the funnel summary line, then the
+    /// ranked result grid, from the last "Run pipeline" click.
+    fn render_pipeline(&mut self, ui: &mut egui::Ui, open_request: &mut Option<PathBuf>) {
+        let Some(result) = &self.pipeline_result else {
+            ui.label(
+                "Click \"Run pipeline\" to filter, dedupe, and rank down to a shortlist.",
+            );
+            return;
+        };
+        let summary = format!(
+            "{} photos → {} after technical filter (score > {:.0}) → {} after dedupe → top {} shown",
+            result.total,
+            result.after_technical,
+            self.cull_threshold,
+            result.after_dedupe,
+            result.shortlist.len()
+        );
+        let shortlist = result.shortlist.clone();
+
+        ui.label(summary);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                self.photo_row_grid(ui, &shortlist, None, None, open_request);
+            });
+    }
 }
 
 impl eframe::App for Photo2CullApp {
@@ -783,6 +887,7 @@ impl eframe::App for Photo2CullApp {
                     .selected_text(match self.view_mode {
                         ViewMode::Flat => "All photos",
                         ViewMode::Grouped => "Duplicate groups",
+                        ViewMode::Pipeline => "Pipeline shortlist",
                     })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.view_mode, ViewMode::Flat, "All photos");
@@ -791,7 +896,33 @@ impl eframe::App for Photo2CullApp {
                             ViewMode::Grouped,
                             "Duplicate groups",
                         );
+                        ui.selectable_value(
+                            &mut self.view_mode,
+                            ViewMode::Pipeline,
+                            "Pipeline shortlist",
+                        );
                     });
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("Pipeline shortlist size");
+                ui.add(
+                    egui::DragValue::new(&mut self.pipeline_top_n)
+                        .speed(1)
+                        .range(1..=100_000),
+                );
+                ui.small("technical filter -> dedupe (best of group) -> rank by Overall -> top N");
+
+                ui.separator();
+
+                let can_run = !self.entries.is_empty() && !self.scanning;
+                if ui
+                    .add_enabled(can_run, egui::Button::new("Run pipeline"))
+                    .clicked()
+                {
+                    self.run_pipeline();
+                    self.view_mode = ViewMode::Pipeline;
+                }
             });
 
             if self.show_weights {
@@ -878,6 +1009,9 @@ impl eframe::App for Photo2CullApp {
                 }
                 ViewMode::Grouped => {
                     self.render_groups(ui, &mut open_request);
+                }
+                ViewMode::Pipeline => {
+                    self.render_pipeline(ui, &mut open_request);
                 }
             }
 
