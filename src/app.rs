@@ -546,7 +546,14 @@ impl eframe::App for Photo2CullApp {
 
             let mut open_request: Option<PathBuf> = None;
 
-            egui::ScrollArea::vertical().show(ui, |ui| {
+            // `auto_shrink` defaults to [true, true], meaning the area
+            // shrinks its *width* to fit its content -- which starves the
+            // horizontal_wrapped layout below of a real width to wrap
+            // against, so it never wraps to a new row. Pin the width to
+            // the panel's, leaving only the vertical axis auto-sized.
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     for idx in order {
                         let flagged = cutoff.map(|c| self.entries[idx].score <= c).unwrap_or(false);
