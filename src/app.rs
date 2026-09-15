@@ -1,10 +1,10 @@
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
 
-use crate::scan::{run_recompute, run_scan, RecomputeEvent, ScanEvent, ScanMode};
+use crate::scan::{RecomputeEvent, ScanEvent, ScanMode, run_recompute, run_scan};
 use crate::sharpness::PhotoMode;
 
 struct PhotoEntry {
@@ -102,7 +102,9 @@ impl Photo2CullApp {
         if self.moving {
             return;
         }
-        let Some(root) = self.root.clone() else { return };
+        let Some(root) = self.root.clone() else {
+            return;
+        };
         let Some(cutoff) = self.cull_cutoff() else {
             return;
         };
@@ -238,7 +240,9 @@ impl Photo2CullApp {
     }
 
     fn start_scan(&mut self) {
-        let Some(root) = self.root.clone() else { return };
+        let Some(root) = self.root.clone() else {
+            return;
+        };
         self.entries.clear();
         self.errors.clear();
         self.total_found = 0;
@@ -435,18 +439,17 @@ impl eframe::App for Photo2CullApp {
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.scan_mode, ScanMode::Auto, "Auto");
                         for m in PhotoMode::ALL {
-                            ui.selectable_value(
-                                &mut self.scan_mode,
-                                ScanMode::Fixed(m),
-                                m.label(),
-                            );
+                            ui.selectable_value(&mut self.scan_mode, ScanMode::Fixed(m), m.label());
                         }
                     });
 
                 ui.separator();
 
                 let can_scan = self.root.is_some() && !self.scanning;
-                if ui.add_enabled(can_scan, egui::Button::new("Scan")).clicked() {
+                if ui
+                    .add_enabled(can_scan, egui::Button::new("Scan"))
+                    .clicked()
+                {
                     self.start_scan();
                 }
 
@@ -546,71 +549,93 @@ impl eframe::App for Photo2CullApp {
 
             let mut open_request: Option<PathBuf> = None;
 
+            const CARD_WIDTH: f32 = 180.0;
+
             // `auto_shrink` defaults to [true, true], meaning the area
-            // shrinks its *width* to fit its content -- which starves the
-            // horizontal_wrapped layout below of a real width to wrap
-            // against, so it never wraps to a new row. Pin the width to
-            // the panel's, leaving only the vertical axis auto-sized.
+            // shrinks its *width* to fit its content -- pin it to the
+            // panel's, leaving only the vertical axis auto-sized.
             egui::ScrollArea::vertical()
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    for idx in order {
-                        let flagged = cutoff.map(|c| self.entries[idx].score <= c).unwrap_or(false);
-                        ui.group(|ui| {
-                            ui.set_width(180.0);
-                            ui.vertical(|ui| {
-                                let entry = &self.entries[idx];
-                                let size = entry.texture.size_vec2();
-                                let max_dim = 160.0_f32;
-                                let scale = (max_dim / size.x.max(size.y)).min(1.0);
-                                let image_response = ui
-                                    .image((entry.texture.id(), size * scale))
-                                    .interact(egui::Sense::click());
-                                if image_response.double_clicked() {
-                                    open_request = Some(entry.path.clone());
-                                }
-                                let name = entry
-                                    .path
-                                    .file_name()
-                                    .map(|n| n.to_string_lossy().to_string())
-                                    .unwrap_or_default();
-                                if flagged {
-                                    ui.colored_label(egui::Color32::from_rgb(220, 90, 90), name);
-                                } else {
-                                    ui.label(name);
-                                }
+                    // `horizontal_wrapped` (egui 0.36.2) corrupts its row-height
+                    // tracking once it wraps, if the wrapped items contain a
+                    // nested child Ui (ui.group/ui.vertical/etc, as our cards
+                    // do) -- every row after the first balloons in height
+                    // instead of the layout starting a new one. Chunking into
+                    // plain (non-wrapping) horizontal rows ourselves sidesteps
+                    // that entirely and is a standard pattern for this anyway.
+                    let spacing = ui.spacing().item_spacing.x;
+                    let columns = ((ui.available_width() / (CARD_WIDTH + spacing)).floor()
+                        as usize)
+                        .max(1);
 
-                                ui.horizontal(|ui| {
-                                    let mut mode = self.entries[idx].mode;
-                                    egui::ComboBox::from_id_salt(("photo-mode", idx))
-                                        .selected_text(mode.label())
-                                        .width(88.0)
-                                        .show_ui(ui, |ui| {
-                                            for m in PhotoMode::ALL {
-                                                ui.selectable_value(&mut mode, m, m.label());
+                    for row in order.chunks(columns) {
+                        ui.horizontal(|ui| {
+                            for &idx in row {
+                                let flagged =
+                                    cutoff.map(|c| self.entries[idx].score <= c).unwrap_or(false);
+                                ui.group(|ui| {
+                                    ui.set_width(CARD_WIDTH);
+                                    ui.vertical(|ui| {
+                                        let entry = &self.entries[idx];
+                                        let size = entry.texture.size_vec2();
+                                        let max_dim = 160.0_f32;
+                                        let scale = (max_dim / size.x.max(size.y)).min(1.0);
+                                        let image_response = ui
+                                            .image((entry.texture.id(), size * scale))
+                                            .interact(egui::Sense::click());
+                                        if image_response.double_clicked() {
+                                            open_request = Some(entry.path.clone());
+                                        }
+                                        let name = entry
+                                            .path
+                                            .file_name()
+                                            .map(|n| n.to_string_lossy().to_string())
+                                            .unwrap_or_default();
+                                        if flagged {
+                                            ui.colored_label(
+                                                egui::Color32::from_rgb(220, 90, 90),
+                                                name,
+                                            );
+                                        } else {
+                                            ui.label(name);
+                                        }
+
+                                        ui.horizontal(|ui| {
+                                            let mut mode = self.entries[idx].mode;
+                                            egui::ComboBox::from_id_salt(("photo-mode", idx))
+                                                .selected_text(mode.label())
+                                                .width(88.0)
+                                                .show_ui(ui, |ui| {
+                                                    for m in PhotoMode::ALL {
+                                                        ui.selectable_value(
+                                                            &mut mode,
+                                                            m,
+                                                            m.label(),
+                                                        );
+                                                    }
+                                                });
+                                            if mode != self.entries[idx].mode {
+                                                self.entries[idx].mode = mode;
+                                                self.entries[idx].dirty = true;
+                                            }
+
+                                            let entry = &self.entries[idx];
+                                            if entry.dirty {
+                                                ui.colored_label(
+                                                    egui::Color32::from_rgb(200, 150, 60),
+                                                    "score: pending…",
+                                                );
+                                            } else {
+                                                ui.label(format!("score: {:.0}", entry.score));
                                             }
                                         });
-                                    if mode != self.entries[idx].mode {
-                                        self.entries[idx].mode = mode;
-                                        self.entries[idx].dirty = true;
-                                    }
-
-                                    let entry = &self.entries[idx];
-                                    if entry.dirty {
-                                        ui.colored_label(
-                                            egui::Color32::from_rgb(200, 150, 60),
-                                            "score: pending…",
-                                        );
-                                    } else {
-                                        ui.label(format!("score: {:.0}", entry.score));
-                                    }
+                                    });
                                 });
-                            });
+                            }
                         });
                     }
                 });
-            });
 
             if let Some(path) = open_request {
                 self.start_preview_load(path);
