@@ -828,9 +828,14 @@ impl eframe::App for Photo2CullApp {
                             ui,
                             "Composition",
                             &mut self.weights.composition,
-                            "(not scored yet)",
+                            "(rule-of-thirds heuristic)",
                         );
-                        pct(ui, "Subject", &mut self.weights.subject, "(not scored yet)");
+                        pct(
+                            ui,
+                            "Subject",
+                            &mut self.weights.subject,
+                            "(Portrait only: face prominence)",
+                        );
                     });
                 });
             }

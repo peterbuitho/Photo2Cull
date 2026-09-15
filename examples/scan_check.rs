@@ -28,10 +28,10 @@ fn main() {
                     None => guess_landscape_or_object(&img),
                 };
                 let s = score(&img, mode, best_face.as_ref());
-                let m = metrics::compute(&img, s);
+                let m = metrics::compute(&img, s, best_face.as_ref());
                 let overall = overall_score(&m, &Weights::default());
                 println!(
-                    "{}: OK {}x{} mode={:?} face={} score={:.0} sharp={:.0} exp={:.0} contrast={:.0} color={:.0} overall={:.0} ({:?})",
+                    "{}: OK {}x{} mode={:?} face={} score={:.0} sharp={:.0} exp={:.0} contrast={:.0} color={:.0} comp={:.0} subj={} overall={:.0} ({:?})",
                     path.file_name().unwrap().to_string_lossy(),
                     img.width(),
                     img.height(),
@@ -42,6 +42,8 @@ fn main() {
                     m.exposure,
                     m.contrast,
                     m.color,
+                    m.composition.unwrap_or(-1.0),
+                    m.subject.map(|v| format!("{v:.0}")).unwrap_or_else(|| "-".to_string()),
                     overall,
                     start.elapsed()
                 );

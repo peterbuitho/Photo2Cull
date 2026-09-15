@@ -36,9 +36,8 @@ pub enum ScanMode {
 }
 
 /// Classify (if `Auto`) and score a single already-decoded photo: the
-/// existing absolute sharpness score plus the Phase-1 Overall-score
-/// factors (exposure/contrast/color, and sharpness normalized for blending
-/// -- see `metrics::compute`).
+/// existing absolute sharpness score plus the full set of Overall-score
+/// factors (see `metrics::compute`).
 fn classify_and_score(img: &RgbImage, scan_mode: ScanMode) -> (PhotoMode, f64, Metrics) {
     let (mode, face) = match scan_mode {
         ScanMode::Auto => match detect_main_face(img) {
@@ -55,7 +54,7 @@ fn classify_and_score(img: &RgbImage, scan_mode: ScanMode) -> (PhotoMode, f64, M
         }
     };
     let s = score(img, mode, face.as_ref());
-    let metrics = metrics::compute(img, s);
+    let metrics = metrics::compute(img, s, face.as_ref());
     (mode, s, metrics)
 }
 
