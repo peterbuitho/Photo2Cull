@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use photo2cull::classify::detect_main_face;
+use photo2cull::metrics::{self, overall_score, Weights};
 use photo2cull::photo::{decode_photo, is_supported_photo};
 use photo2cull::sharpness::{guess_landscape_or_object, score, PhotoMode};
 
@@ -27,14 +28,21 @@ fn main() {
                     None => guess_landscape_or_object(&img),
                 };
                 let s = score(&img, mode, best_face.as_ref());
+                let m = metrics::compute(&img, s);
+                let overall = overall_score(&m, &Weights::default());
                 println!(
-                    "{}: OK {}x{} mode={:?} face={} score={:.0} ({:?})",
+                    "{}: OK {}x{} mode={:?} face={} score={:.0} sharp={:.0} exp={:.0} contrast={:.0} color={:.0} overall={:.0} ({:?})",
                     path.file_name().unwrap().to_string_lossy(),
                     img.width(),
                     img.height(),
                     mode,
                     best_face.is_some(),
                     s,
+                    m.sharpness,
+                    m.exposure,
+                    m.contrast,
+                    m.color,
+                    overall,
                     start.elapsed()
                 );
             }

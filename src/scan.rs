@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use walkdir::WalkDir;
 
 use crate::classify::detect_main_face;
+use crate::metrics::{self, Metrics};
 use crate::photo::{decode_photo, is_supported_photo};
 use crate::sharpness::{guess_landscape_or_object, score, PhotoMode};
 
@@ -33,8 +34,11 @@ pub enum ScanMode {
     Fixed(PhotoMode),
 }
 
-/// Classify (if `Auto`) and score a single already-decoded photo.
-fn classify_and_score(img: &RgbImage, scan_mode: ScanMode) -> (PhotoMode, f64) {
+/// Classify (if `Auto`) and score a single already-decoded photo: the
+/// existing absolute sharpness score plus the Phase-1 Overall-score
+/// factors (exposure/contrast/color, and sharpness normalized for blending
+/// -- see `metrics::compute`).
+fn classify_and_score(img: &RgbImage, scan_mode: ScanMode) -> (PhotoMode, f64, Metrics) {
     let (mode, face) = match scan_mode {
         ScanMode::Auto => match detect_main_face(img) {
             Some(f) => (PhotoMode::Portrait, Some(f)),
@@ -50,13 +54,15 @@ fn classify_and_score(img: &RgbImage, scan_mode: ScanMode) -> (PhotoMode, f64) {
         }
     };
     let s = score(img, mode, face.as_ref());
-    (mode, s)
+    let metrics = metrics::compute(img, s);
+    (mode, s, metrics)
 }
 
 pub struct PhotoResult {
     pub path: PathBuf,
     pub mode: PhotoMode,
     pub score: f64,
+    pub metrics: Metrics,
     pub thumb_w: u32,
     pub thumb_h: u32,
     pub thumb_rgb: Vec<u8>,
@@ -89,7 +95,7 @@ pub fn run_scan(root: PathBuf, scan_mode: ScanMode, tx: Sender<ScanEvent>) {
     files.par_iter().for_each_with(tx.clone(), |tx, path| {
         match decode_photo(path, SCORE_MAX_DIM) {
             Ok(img) => {
-                let (mode, s) = classify_and_score(&img, scan_mode);
+                let (mode, s, metrics) = classify_and_score(&img, scan_mode);
                 // `DynamicImage::resize` (the method) fits within the box,
                 // preserving aspect ratio; the free functions
                 // `imageops::resize`/`thumbnail` both stretch to it exactly.
@@ -104,6 +110,7 @@ pub fn run_scan(root: PathBuf, scan_mode: ScanMode, tx: Sender<ScanEvent>) {
                     path: path.clone(),
                     mode,
                     score: s,
+                    metrics,
                     thumb_w: thumb.width(),
                     thumb_h: thumb.height(),
                     thumb_rgb: thumb.into_raw(),
@@ -121,6 +128,7 @@ pub fn run_scan(root: PathBuf, scan_mode: ScanMode, tx: Sender<ScanEvent>) {
 pub struct RecomputeResult {
     pub path: PathBuf,
     pub score: f64,
+    pub metrics: Metrics,
 }
 
 pub enum RecomputeEvent {
@@ -134,10 +142,11 @@ pub enum RecomputeEvent {
 pub fn run_recompute(items: Vec<(PathBuf, PhotoMode)>, tx: Sender<RecomputeEvent>) {
     items.par_iter().for_each_with(tx.clone(), |tx, (path, mode)| {
         if let Ok(img) = decode_photo(path, SCORE_MAX_DIM) {
-            let (_, s) = classify_and_score(&img, ScanMode::Fixed(*mode));
+            let (_, s, metrics) = classify_and_score(&img, ScanMode::Fixed(*mode));
             let _ = tx.send(RecomputeEvent::Result(RecomputeResult {
                 path: path.clone(),
                 score: s,
+                metrics,
             }));
         }
     });

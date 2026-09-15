@@ -4,6 +4,7 @@ use std::thread;
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
 
+use crate::metrics::{overall_score, Metrics, Weights};
 use crate::scan::{DISQUALIFIED_DIR, RecomputeEvent, ScanEvent, ScanMode, run_recompute, run_scan};
 use crate::sharpness::PhotoMode;
 
@@ -11,10 +12,22 @@ struct PhotoEntry {
     path: PathBuf,
     mode: PhotoMode,
     score: f64,
+    metrics: Metrics,
     /// True if `mode` was changed (manually, or by a rescan) since `score`
-    /// was last computed for it -- i.e. the score shown is stale.
+    /// (and `metrics`) was last computed for it -- i.e. the values shown
+    /// are stale.
     dirty: bool,
     texture: TextureHandle,
+}
+
+/// Which score the grid is sorted (and, for `Overall`, flagged) by. The
+/// absolute-sharpness cull/Recalculate/Move-disqualified flow always
+/// operates on `score` regardless of this -- Overall is a separate,
+/// additional way to look at the same photos, not a replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortBy {
+    Sharpness,
+    Overall,
 }
 
 /// The image cap for the double-click "full size" preview. Not the true
@@ -66,6 +79,9 @@ pub struct Photo2CullApp {
     move_moved: usize,
     move_failed: usize,
     move_status: Option<String>,
+    weights: Weights,
+    sort_by: SortBy,
+    show_weights: bool,
 }
 
 impl Photo2CullApp {
@@ -89,6 +105,9 @@ impl Photo2CullApp {
             move_moved: 0,
             move_failed: 0,
             move_status: None,
+            weights: Weights::default(),
+            sort_by: SortBy::Sharpness,
+            show_weights: false,
         }
     }
 
@@ -293,6 +312,7 @@ impl Photo2CullApp {
                             path: p.path,
                             mode: p.mode,
                             score: p.score,
+                            metrics: p.metrics,
                             dirty: false,
                             texture,
                         });
@@ -317,6 +337,7 @@ impl Photo2CullApp {
                     RecomputeEvent::Result(r) => {
                         if let Some(entry) = self.entries.iter_mut().find(|e| e.path == r.path) {
                             entry.score = r.score;
+                            entry.metrics = r.metrics;
                             entry.dirty = false;
                         }
                     }
@@ -530,18 +551,83 @@ impl eframe::App for Photo2CullApp {
                     ui.label("recalculate pending changes first");
                 }
             });
+
+            ui.horizontal(|ui| {
+                ui.label("Sort by");
+                egui::ComboBox::from_id_salt("sort-by")
+                    .selected_text(match self.sort_by {
+                        SortBy::Sharpness => "Sharpness",
+                        SortBy::Overall => "Overall",
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.sort_by, SortBy::Sharpness, "Sharpness");
+                        ui.selectable_value(&mut self.sort_by, SortBy::Overall, "Overall");
+                    });
+                ui.checkbox(&mut self.show_weights, "Weights");
+            });
+
+            if self.show_weights {
+                ui.group(|ui| {
+                    ui.label(
+                        "Overall = weighted blend of these factors, each 0-100. \
+                         Weights don't need to add to 100% -- they're renormalized \
+                         over whatever's scored.",
+                    );
+                    egui::Grid::new("weights-grid").num_columns(2).show(ui, |ui| {
+                        let pct = |ui: &mut egui::Ui, label: &str, w: &mut f32, note: &str| {
+                            ui.label(label);
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(w)
+                                        .speed(0.01)
+                                        .range(0.0..=1.0)
+                                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                        .custom_parser(|s| {
+                                            s.trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)
+                                        }),
+                                );
+                                if !note.is_empty() {
+                                    ui.small(note);
+                                }
+                            });
+                            ui.end_row();
+                        };
+                        pct(ui, "Sharpness", &mut self.weights.sharpness, "");
+                        pct(ui, "Exposure", &mut self.weights.exposure, "");
+                        pct(ui, "Contrast", &mut self.weights.contrast, "");
+                        pct(ui, "Color", &mut self.weights.color, "");
+                        pct(
+                            ui,
+                            "Composition",
+                            &mut self.weights.composition,
+                            "(not scored yet)",
+                        );
+                        pct(ui, "Subject", &mut self.weights.subject, "(not scored yet)");
+                    });
+                });
+            }
+
             if !self.errors.is_empty() {
                 ui.label(format!("{} files failed to decode", self.errors.len()));
             }
             ui.separator();
 
             let mut order: Vec<usize> = (0..self.entries.len()).collect();
-            order.sort_by(|&a, &b| {
-                self.entries[a]
-                    .score
-                    .partial_cmp(&self.entries[b].score)
-                    .unwrap()
-            });
+            match self.sort_by {
+                SortBy::Sharpness => order.sort_by(|&a, &b| {
+                    self.entries[a]
+                        .score
+                        .partial_cmp(&self.entries[b].score)
+                        .unwrap()
+                }),
+                SortBy::Overall => order.sort_by(|&a, &b| {
+                    let oa = overall_score(&self.entries[a].metrics, &self.weights);
+                    let ob = overall_score(&self.entries[b].metrics, &self.weights);
+                    // Higher Overall first -- unlike Sharpness, where worst-first
+                    // matches "what should I cull", Overall is "what's best".
+                    ob.partial_cmp(&oa).unwrap()
+                }),
+            }
 
             let mut open_request: Option<PathBuf> = None;
 
@@ -626,6 +712,11 @@ impl eframe::App for Photo2CullApp {
                                                 ui.label(format!("score: {:.0}", entry.score));
                                             }
                                         });
+                                        if !self.entries[idx].dirty {
+                                            let overall =
+                                                overall_score(&self.entries[idx].metrics, &self.weights);
+                                            ui.small(format!("overall: {overall:.0}"));
+                                        }
                                     });
                                 });
                             }
