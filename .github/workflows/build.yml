@@ -50,11 +50,32 @@ jobs:
       - name: Build release
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Package macOS .app and .dmg
+        if: runner.os == 'macOS'
+        run: |
+          set -eu
+          VERSION=$(grep '^version' Cargo.toml | head -1 | sed -E 's/version = "(.*)"/\1/')
+          APP="Photo2Cull.app"
+          BIN="target/${{ matrix.target }}/release/photo2cull"
+
+          mkdir -p "$APP/Contents/MacOS"
+          cp "$BIN" "$APP/Contents/MacOS/photo2cull"
+          chmod +x "$APP/Contents/MacOS/photo2cull"
+          sed "s/__VERSION__/$VERSION/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+
+          # Stage the .app next to a symlink to /Applications so the .dmg
+          # opens as the standard "drag to Applications" install UX.
+          mkdir -p dmg-staging
+          cp -R "$APP" dmg-staging/
+          ln -s /Applications dmg-staging/Applications
+
+          hdiutil create -volname Photo2Cull -srcfolder dmg-staging -ov -format UDZO Photo2Cull.dmg
+
       - uses: actions/upload-artifact@v4
         with:
           name: photo2cull-${{ matrix.name }}
           path: |
             target/${{ matrix.target }}/release/photo2cull
             target/${{ matrix.target }}/release/photo2cull.exe
-            target/${{ matrix.target }}/release/photo2cull.app
+            Photo2Cull.dmg
           if-no-files-found: ignore
