@@ -10,9 +10,53 @@ use crate::metrics::{overall_score, Metrics, Weights};
 use crate::scan::{DISQUALIFIED_DIR, RecomputeEvent, ScanEvent, ScanMode, run_recompute, run_scan};
 use crate::sharpness::PhotoMode;
 
+/// Fixed square thumbnail slot on the left of each photo card. Fixed rather
+/// than sized to the image's own aspect ratio so the info column to its
+/// right always starts at the same x offset -- otherwise a mix of portrait
+/// and landscape thumbnails makes the info jump around from card to card.
+const THUMB_BOX: f32 = 120.0;
+
+/// Fixed width of the info column to the right of the thumbnail (filename,
+/// mode dropdown, score badge, overall). Fixed rather than "whatever's
+/// left" so the card doesn't balloon out to fill the row and leave a slab
+/// of empty space to the right of short filenames -- long filenames wrap
+/// instead of growing the card.
+const INFO_WIDTH: f32 = 130.0;
+
 /// Width (excluding the group's frame/margin) of each photo card, shared by
-/// the flat grid and the duplicate-groups view.
-const CARD_WIDTH: f32 = 180.0;
+/// the flat grid and the duplicate-groups view. Only used to plan how many
+/// cards fit per row -- the card's actual rendered width is `THUMB_BOX` +
+/// spacing + `INFO_WIDTH`, which this tracks.
+const CARD_WIDTH: f32 = THUMB_BOX + INFO_WIDTH;
+
+/// Raw (absolute, unbounded) sharpness-score boundaries for the
+/// blurry/soft/sharp badge on each photo card.
+const SHARPNESS_BLURRY_MAX: f64 = 40.0;
+const SHARPNESS_SOFT_MAX: f64 = 100.0;
+
+/// Background fill + readable text color for a raw sharpness score's
+/// blurry/soft/sharp bucket, for the score badge on each photo card.
+fn sharpness_bucket_colors(raw: f64) -> (egui::Color32, egui::Color32) {
+    if raw <= SHARPNESS_BLURRY_MAX {
+        // Blurry: red background, white text.
+        (
+            egui::Color32::from_rgb(200, 60, 60),
+            egui::Color32::WHITE,
+        )
+    } else if raw <= SHARPNESS_SOFT_MAX {
+        // Soft: yellow background, black text.
+        (
+            egui::Color32::from_rgb(230, 200, 60),
+            egui::Color32::BLACK,
+        )
+    } else {
+        // Sharp: green background, white text.
+        (
+            egui::Color32::from_rgb(80, 160, 80),
+            egui::Color32::WHITE,
+        )
+    }
+}
 
 struct PhotoEntry {
     path: PathBuf,
@@ -535,11 +579,15 @@ impl Photo2CullApp {
     }
 
     /// One photo card: thumbnail (double-click to open the full-size
-    /// preview), filename (red if `flagged`), the type dropdown, the
-    /// absolute sharpness score, and the Overall score. Shared by the flat
-    /// grid and the duplicate-groups view so they can't drift apart.
-    /// `badge`, if given, is drawn as a colored label under the filename
-    /// (e.g. marking the best-of-group pick).
+    /// preview) on the left, with filename (red if `flagged`), the type
+    /// dropdown, the absolute sharpness score, and the Overall score
+    /// stacked in a column to its right. Shared by the flat grid and the
+    /// duplicate-groups view so they can't drift apart. `badge`, if given,
+    /// is drawn as a colored label under the filename (e.g. marking the
+    /// best-of-group pick). The thumbnail sits in a fixed-size square slot
+    /// (see `THUMB_BOX`) regardless of the photo's own aspect ratio, so the
+    /// info column lines up the same way across a mix of portrait and
+    /// landscape photos instead of jumping around card to card.
     fn photo_card(
         &mut self,
         ui: &mut egui::Ui,
@@ -549,33 +597,39 @@ impl Photo2CullApp {
         open_request: &mut Option<PathBuf>,
     ) {
         ui.group(|ui| {
-            ui.set_width(CARD_WIDTH);
-            ui.vertical(|ui| {
+            ui.horizontal_top(|ui| {
                 let entry = &self.entries[idx];
                 let size = entry.texture.size_vec2();
-                let max_dim = 160.0_f32;
-                let scale = (max_dim / size.x.max(size.y)).min(1.0);
-                let image_response = ui
-                    .image((entry.texture.id(), size * scale))
-                    .interact(egui::Sense::click());
+                let scale = (THUMB_BOX / size.x.max(size.y)).min(1.0);
+                let img_size = size * scale;
+                let (slot_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(THUMB_BOX, THUMB_BOX), egui::Sense::hover());
+                let image_rect = egui::Rect::from_center_size(slot_rect.center(), img_size);
+                let image_response = ui.put(
+                    image_rect,
+                    egui::Image::new((entry.texture.id(), img_size)).sense(egui::Sense::click()),
+                );
                 if image_response.double_clicked() {
                     *open_request = Some(entry.path.clone());
                 }
-                let name = entry
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if flagged {
-                    ui.colored_label(egui::Color32::from_rgb(220, 90, 90), name);
-                } else {
-                    ui.label(name);
-                }
-                if let Some((color, text)) = badge {
-                    ui.colored_label(color, text);
-                }
 
-                ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(INFO_WIDTH);
+                    let entry = &self.entries[idx];
+                    let name = entry
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    if flagged {
+                        ui.colored_label(egui::Color32::from_rgb(220, 90, 90), name);
+                    } else {
+                        ui.label(name);
+                    }
+                    if let Some((color, text)) = badge {
+                        ui.colored_label(color, text);
+                    }
+
                     let mut mode = self.entries[idx].mode;
                     egui::ComboBox::from_id_salt(("photo-mode", idx))
                         .selected_text(mode.label())
@@ -594,13 +648,16 @@ impl Photo2CullApp {
                     if entry.dirty {
                         ui.colored_label(egui::Color32::from_rgb(200, 150, 60), "score: pending…");
                     } else {
-                        ui.label(format!("score: {:.0}", entry.score));
+                        let (bg, fg) = sharpness_bucket_colors(entry.score);
+                        ui.label(
+                            egui::RichText::new(format!("score: {:.0}", entry.score))
+                                .color(fg)
+                                .background_color(bg),
+                        );
+                        let overall = overall_score(&self.entries[idx].metrics, &self.weights);
+                        ui.small(format!("overall: {overall:.0}"));
                     }
                 });
-                if !self.entries[idx].dirty {
-                    let overall = overall_score(&self.entries[idx].metrics, &self.weights);
-                    ui.small(format!("overall: {overall:.0}"));
-                }
             });
         });
     }
