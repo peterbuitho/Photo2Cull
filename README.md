@@ -2,6 +2,8 @@
 
 A desktop app for quickly culling a folder of photos down to your keepers -- point it at a folder, it scores every photo, and you decide what survives.
 
+![Photo2Cull screenshot](docs/screenshot.png)
+
 ## What it does
 
 - **Scans a folder** of RAW (via `rawler`) or standard photos (PNG, JPG, TIFF, BMP, WebP) and scores each one for focus sharpness (variance-of-Laplacian).
