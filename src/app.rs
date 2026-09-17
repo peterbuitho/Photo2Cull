@@ -6,7 +6,7 @@ use std::thread;
 use egui::{ColorImage, TextureHandle, TextureOptions};
 
 use crate::dedupe::group_duplicates;
-use crate::metrics::{overall_score, Metrics, Weights};
+use crate::metrics::{Metrics, Weights, overall_score};
 use crate::scan::{DISQUALIFIED_DIR, RecomputeEvent, ScanEvent, ScanMode, run_recompute, run_scan};
 use crate::sharpness::PhotoMode;
 
@@ -39,22 +39,13 @@ const SHARPNESS_SOFT_MAX: f64 = 100.0;
 fn sharpness_bucket_colors(raw: f64) -> (egui::Color32, egui::Color32) {
     if raw <= SHARPNESS_BLURRY_MAX {
         // Blurry: red background, white text.
-        (
-            egui::Color32::from_rgb(200, 60, 60),
-            egui::Color32::WHITE,
-        )
+        (egui::Color32::from_rgb(200, 60, 60), egui::Color32::WHITE)
     } else if raw <= SHARPNESS_SOFT_MAX {
         // Soft: yellow background, black text.
-        (
-            egui::Color32::from_rgb(230, 200, 60),
-            egui::Color32::BLACK,
-        )
+        (egui::Color32::from_rgb(230, 200, 60), egui::Color32::BLACK)
     } else {
         // Sharp: green background, white text.
-        (
-            egui::Color32::from_rgb(80, 160, 80),
-            egui::Color32::WHITE,
-        )
+        (egui::Color32::from_rgb(80, 160, 80), egui::Color32::WHITE)
     }
 }
 
@@ -80,13 +71,13 @@ enum ViewMode {
     /// Only photos belonging to a duplicate/burst group, one section per
     /// group, from the last "Group duplicates" click.
     Grouped,
-    /// The funnel result from the last "Run pipeline" click: technical
+    /// The funnel result from the last "Rank now" click: technical
     /// filter -> dedupe (best-of-group) -> rank by Overall -> top N.
     Pipeline,
 }
 
 /// Result of running the full funnel (technical filter -> dedupe -> rank)
-/// down to a shortlist, from the last "Run pipeline" click.
+/// down to a shortlist, from the last "Rank now" click.
 struct PipelineResult {
     total: usize,
     after_technical: usize,
@@ -157,7 +148,6 @@ pub struct Photo2CullApp {
     move_status: Option<String>,
     weights: Weights,
     sort_by: SortBy,
-    show_weights: bool,
     view_mode: ViewMode,
     /// Duplicate/burst clusters (2+ members each) from the last "Group
     /// duplicates" click; empty until then. Stored as paths rather than
@@ -185,7 +175,7 @@ impl Photo2CullApp {
             rx: None,
             recompute_rx: None,
             recomputing: false,
-            cull_threshold: 40.0,
+            cull_threshold: 32.0,
             viewer: None,
             preview_rx: None,
             moving: false,
@@ -195,7 +185,6 @@ impl Photo2CullApp {
             move_status: None,
             weights: Weights::default(),
             sort_by: SortBy::Sharpness,
-            show_weights: false,
             view_mode: ViewMode::Flat,
             groups: Vec::new(),
             group_threshold: 6,
@@ -208,8 +197,11 @@ impl Photo2CullApp {
     /// distance. Cheap enough (a single XOR+popcount per pair) to run
     /// synchronously from a button click even for several thousand photos.
     fn compute_groups(&mut self) {
-        let photos: Vec<(PathBuf, u64)> =
-            self.entries.iter().map(|e| (e.path.clone(), e.phash)).collect();
+        let photos: Vec<(PathBuf, u64)> = self
+            .entries
+            .iter()
+            .map(|e| (e.path.clone(), e.phash))
+            .collect();
         self.groups = group_duplicates(&photos, self.group_threshold);
     }
 
@@ -222,8 +214,9 @@ impl Photo2CullApp {
     fn run_pipeline(&mut self) {
         let total = self.entries.len();
         let cutoff = self.cull_threshold;
-        let survivors: Vec<usize> =
-            (0..total).filter(|&i| self.entries[i].score > cutoff).collect();
+        let survivors: Vec<usize> = (0..total)
+            .filter(|&i| self.entries[i].score > cutoff)
+            .collect();
         let after_technical = survivors.len();
 
         let photos: Vec<(PathBuf, u64)> = survivors
@@ -232,20 +225,23 @@ impl Photo2CullApp {
             .collect();
         let groups = group_duplicates(&photos, self.group_threshold);
 
-        let path_to_idx: HashMap<PathBuf, usize> =
-            survivors.iter().map(|&i| (self.entries[i].path.clone(), i)).collect();
+        let path_to_idx: HashMap<PathBuf, usize> = survivors
+            .iter()
+            .map(|&i| (self.entries[i].path.clone(), i))
+            .collect();
         let grouped_paths: std::collections::HashSet<PathBuf> =
             groups.iter().flatten().cloned().collect();
 
         let mut keepers: Vec<usize> = Vec::new();
         for group in &groups {
-            let best = group.iter().filter_map(|p| path_to_idx.get(p).copied()).max_by(
-                |&a, &b| {
+            let best = group
+                .iter()
+                .filter_map(|p| path_to_idx.get(p).copied())
+                .max_by(|&a, &b| {
                     overall_score(&self.entries[a].metrics, &self.weights)
                         .partial_cmp(&overall_score(&self.entries[b].metrics, &self.weights))
                         .unwrap()
-                },
-            );
+                });
             keepers.extend(best);
         }
         for &i in &survivors {
@@ -681,7 +677,9 @@ impl Photo2CullApp {
         for row in indices.chunks(columns) {
             ui.horizontal(|ui| {
                 for &idx in row {
-                    let flagged = cutoff.map(|c| self.entries[idx].score <= c).unwrap_or(false);
+                    let flagged = cutoff
+                        .map(|c| self.entries[idx].score <= c)
+                        .unwrap_or(false);
                     let badge = (Some(idx) == best_idx)
                         .then_some((egui::Color32::from_rgb(90, 170, 90), "★ best of group"));
                     self.photo_card(ui, idx, flagged, badge, open_request);
@@ -737,12 +735,10 @@ impl Photo2CullApp {
     }
 
     /// The pipeline shortlist view: the funnel summary line, then the
-    /// ranked result grid, from the last "Run pipeline" click.
+    /// ranked result grid, from the last "Rank now" click.
     fn render_pipeline(&mut self, ui: &mut egui::Ui, open_request: &mut Option<PathBuf>) {
         let Some(result) = &self.pipeline_result else {
-            ui.label(
-                "Click \"Run pipeline\" to filter, dedupe, and rank down to a shortlist.",
-            );
+            ui.label("Click \"Rank now\" to filter, dedupe, and rank down to a shortlist.");
             return;
         };
         let summary = format!(
@@ -811,10 +807,19 @@ impl eframe::App for Photo2CullApp {
                 ui.separator();
 
                 let can_scan = self.root.is_some() && !self.scanning;
-                if ui
-                    .add_enabled(can_scan, egui::Button::new("Scan"))
-                    .clicked()
-                {
+                let scan_label = if can_scan {
+                    egui::RichText::new("Scan")
+                        .strong()
+                        .size(15.0)
+                        .color(egui::Color32::WHITE)
+                } else {
+                    egui::RichText::new("Scan").strong().size(15.0)
+                };
+                let mut scan_button = egui::Button::new(scan_label);
+                if can_scan {
+                    scan_button = scan_button.fill(egui::Color32::from_rgb(40, 120, 200));
+                }
+                if ui.add_enabled(can_scan, scan_button).clicked() {
                     self.start_scan();
                 }
 
@@ -823,6 +828,27 @@ impl eframe::App for Photo2CullApp {
                     ui.label(format!("{} / {}", self.processed, self.total_found));
                 } else if self.total_found > 0 {
                     ui.label(format!("{} photos scanned", self.total_found));
+                }
+
+                ui.separator();
+
+                let dirty_count = self.entries.iter().filter(|e| e.dirty).count();
+                if ui
+                    .add_enabled(
+                        dirty_count > 0 && !self.recomputing,
+                        egui::Button::new("Recalculate"),
+                    )
+                    .clicked()
+                {
+                    self.start_recompute();
+                }
+                if self.recomputing {
+                    ui.spinner();
+                } else if dirty_count > 0 {
+                    ui.label(format!(
+                        "{dirty_count} type change{} pending",
+                        if dirty_count == 1 { "" } else { "s" }
+                    ));
                 }
             });
         });
@@ -844,189 +870,268 @@ impl eframe::App for Photo2CullApp {
                 .unwrap_or(0);
             let dirty_count = self.entries.iter().filter(|e| e.dirty).count();
 
+            // Three sections, each capped to a modest max width rather than
+            // split into equal `ui.columns()` thirds: that helper grows
+            // *all* columns to fit whichever one needs the most room, and
+            // that growth compounds frame over frame (its own doc comment
+            // calls this "make sure we fit everything next frame"), which
+            // spirals a single too-wide line into every section ballooning
+            // off the edge of the window. A small cap keeps each section
+            // sized to its own content (wrapping long notes) and immune to
+            // that feedback loop.
+            let col_width = 150.0;
             ui.horizontal(|ui| {
-                ui.label("Disqualify scores below");
-                ui.add(
-                    egui::DragValue::new(&mut self.cull_threshold)
-                        .speed(1.0)
-                        .range(0.0..=f64::MAX),
-                );
-                if let Some((min, max)) = self.score_range() {
-                    ui.label(format!("(scanned scores range {min:.0}–{max:.0})"));
-                }
+                // Sharpness: the raw per-photo focus score, its cull
+                // threshold/move-out workflow, and duplicate/burst grouping
+                // (grouping runs against the same survivors the cull
+                // threshold defines, so it lives alongside it).
+                ui.vertical(|ui| {
+                    ui.set_max_width(col_width);
+                    ui.group(|ui| {
+                        ui.strong("Sharpness");
+                        ui.separator();
 
-                ui.separator();
+                        ui.horizontal(|ui| {
+                            ui.label("Disqualify scores below");
+                            ui.add(
+                                egui::DragValue::new(&mut self.cull_threshold)
+                                    .speed(1.0)
+                                    .range(0.0..=f64::MAX),
+                            );
+                        });
+                        if let Some((min, max)) = self.score_range() {
+                            ui.small(format!("(scanned scores range {min:.0}–{max:.0})"));
+                        }
 
-                if ui
-                    .add_enabled(
-                        dirty_count > 0 && !self.recomputing,
-                        egui::Button::new("Recalculate"),
-                    )
-                    .clicked()
-                {
-                    self.start_recompute();
-                }
-                if self.recomputing {
-                    ui.spinner();
-                } else if dirty_count > 0 {
-                    ui.label(format!(
-                        "{dirty_count} type change{} pending",
-                        if dirty_count == 1 { "" } else { "s" }
-                    ));
-                }
+                        ui.add_space(4.0);
 
-                ui.separator();
+                        let can_move = flagged_count > 0
+                            && dirty_count == 0
+                            && !self.moving
+                            && !self.scanning
+                            && !self.recomputing;
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    can_move,
+                                    egui::Button::new(format!(
+                                        "Move {flagged_count} disqualified"
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                self.start_move_disqualified();
+                            }
+                            if self.moving {
+                                ui.spinner();
+                            } else if let Some(status) = &self.move_status {
+                                ui.label(status);
+                            } else if dirty_count > 0 && flagged_count > 0 {
+                                ui.label("recalculate pending changes first");
+                            }
+                        });
 
-                let can_move = flagged_count > 0
-                    && dirty_count == 0
-                    && !self.moving
-                    && !self.scanning
-                    && !self.recomputing;
-                if ui
-                    .add_enabled(
-                        can_move,
-                        egui::Button::new(format!("Move {flagged_count} disqualified")),
-                    )
-                    .clicked()
-                {
-                    self.start_move_disqualified();
-                }
-                if self.moving {
-                    ui.spinner();
-                } else if let Some(status) = &self.move_status {
-                    ui.label(status);
-                } else if dirty_count > 0 && flagged_count > 0 {
-                    ui.label("recalculate pending changes first");
-                }
-            });
+                        ui.separator();
 
-            ui.horizontal(|ui| {
-                ui.label("Sort by");
-                egui::ComboBox::from_id_salt("sort-by")
-                    .selected_text(match self.sort_by {
-                        SortBy::Sharpness => "Sharpness",
-                        SortBy::Overall => "Overall",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.sort_by, SortBy::Sharpness, "Sharpness");
-                        ui.selectable_value(&mut self.sort_by, SortBy::Overall, "Overall");
-                    });
-                ui.checkbox(&mut self.show_weights, "Weights");
-            });
+                        ui.horizontal(|ui| {
+                            ui.label("Duplicate/burst threshold");
+                            ui.add(
+                                egui::DragValue::new(&mut self.group_threshold)
+                                    .speed(1)
+                                    .range(0..=64),
+                            );
+                        });
+                        ui.small("(max hash distance, 0-64; lower = stricter)");
 
-            ui.horizontal(|ui| {
-                ui.label("Duplicate/burst threshold");
-                ui.add(
-                    egui::DragValue::new(&mut self.group_threshold)
-                        .speed(1)
-                        .range(0..=64),
-                );
-                ui.small("(max hash distance, 0-64; lower = stricter)");
-
-                ui.separator();
-
-                let can_group = !self.entries.is_empty() && !self.scanning;
-                if ui
-                    .add_enabled(can_group, egui::Button::new("Group duplicates"))
-                    .clicked()
-                {
-                    self.compute_groups();
-                    self.view_mode = ViewMode::Grouped;
-                }
-                if !self.groups.is_empty() {
-                    let grouped: usize = self.groups.iter().map(|g| g.len()).sum();
-                    ui.label(format!("{} groups ({grouped} photos)", self.groups.len()));
-                }
-
-                ui.separator();
-
-                egui::ComboBox::from_id_salt("view-mode")
-                    .selected_text(match self.view_mode {
-                        ViewMode::Flat => "All photos",
-                        ViewMode::Grouped => "Duplicate groups",
-                        ViewMode::Pipeline => "Pipeline shortlist",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.view_mode, ViewMode::Flat, "All photos");
-                        ui.selectable_value(
-                            &mut self.view_mode,
-                            ViewMode::Grouped,
-                            "Duplicate groups",
-                        );
-                        ui.selectable_value(
-                            &mut self.view_mode,
-                            ViewMode::Pipeline,
-                            "Pipeline shortlist",
-                        );
-                    });
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Pipeline shortlist size");
-                ui.add(
-                    egui::DragValue::new(&mut self.pipeline_top_n)
-                        .speed(1)
-                        .range(1..=100_000),
-                );
-                ui.small("technical filter -> dedupe (best of group) -> rank by Overall -> top N");
-
-                ui.separator();
-
-                let can_run = !self.entries.is_empty() && !self.scanning;
-                if ui
-                    .add_enabled(can_run, egui::Button::new("Run pipeline"))
-                    .clicked()
-                {
-                    self.run_pipeline();
-                    self.view_mode = ViewMode::Pipeline;
-                }
-            });
-
-            if self.show_weights {
-                ui.group(|ui| {
-                    ui.label(
-                        "Overall = weighted blend of these factors, each 0-100. \
-                         Weights don't need to add to 100% -- they're renormalized \
-                         over whatever's scored.",
-                    );
-                    egui::Grid::new("weights-grid").num_columns(2).show(ui, |ui| {
-                        let pct = |ui: &mut egui::Ui, label: &str, w: &mut f32, note: &str| {
-                            ui.label(label);
-                            ui.horizontal(|ui| {
-                                ui.add(
-                                    egui::DragValue::new(w)
-                                        .speed(0.01)
-                                        .range(0.0..=1.0)
-                                        .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
-                                        .custom_parser(|s| {
-                                            s.trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)
-                                        }),
-                                );
-                                if !note.is_empty() {
-                                    ui.small(note);
-                                }
-                            });
-                            ui.end_row();
-                        };
-                        pct(ui, "Sharpness", &mut self.weights.sharpness, "");
-                        pct(ui, "Exposure", &mut self.weights.exposure, "");
-                        pct(ui, "Contrast", &mut self.weights.contrast, "");
-                        pct(ui, "Color", &mut self.weights.color, "");
-                        pct(
-                            ui,
-                            "Composition",
-                            &mut self.weights.composition,
-                            "(rule-of-thirds heuristic)",
-                        );
-                        pct(
-                            ui,
-                            "Subject",
-                            &mut self.weights.subject,
-                            "(Portrait only: face prominence)",
-                        );
+                        let can_group = !self.entries.is_empty() && !self.scanning;
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(can_group, egui::Button::new("Group duplicates"))
+                                .clicked()
+                            {
+                                self.compute_groups();
+                                self.view_mode = ViewMode::Grouped;
+                            }
+                            if !self.groups.is_empty() {
+                                let grouped: usize =
+                                    self.groups.iter().map(|g| g.len()).sum();
+                                ui.label(format!(
+                                    "{} groups ({grouped} photos)",
+                                    self.groups.len()
+                                ));
+                            }
+                        });
                     });
                 });
-            }
+
+                // Pipeline: the technical filter -> dedupe -> rank by
+                // Overall -> top N funnel's own parameters, plus how the
+                // results are displayed.
+                ui.vertical(|ui| {
+                    ui.set_max_width(col_width);
+                    ui.group(|ui| {
+                        ui.strong("Ranking pipeline");
+                        ui.separator();
+
+                        ui.horizontal(|ui| {
+                            ui.label("Shortlist size");
+                            ui.add(
+                                egui::DragValue::new(&mut self.pipeline_top_n)
+                                    .speed(1)
+                                    .range(1..=100_000),
+                            );
+                        });
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "technical filter -> dedupe (best of group) -> rank \
+                                     by Overall -> top N",
+                                )
+                                .small(),
+                            )
+                            .wrap(),
+                        );
+
+                        ui.separator();
+
+                        ui.horizontal(|ui| {
+                            ui.label("Sort by");
+                            egui::ComboBox::from_id_salt("sort-by")
+                                .selected_text(match self.sort_by {
+                                    SortBy::Sharpness => "Sharpness",
+                                    SortBy::Overall => "Overall",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.sort_by,
+                                        SortBy::Sharpness,
+                                        "Sharpness",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.sort_by,
+                                        SortBy::Overall,
+                                        "Overall",
+                                    );
+                                });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("View");
+                            egui::ComboBox::from_id_salt("view-mode")
+                                .selected_text(match self.view_mode {
+                                    ViewMode::Flat => "All photos",
+                                    ViewMode::Grouped => "Duplicate groups",
+                                    ViewMode::Pipeline => "Pipeline shortlist",
+                                })
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut self.view_mode,
+                                        ViewMode::Flat,
+                                        "All photos",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.view_mode,
+                                        ViewMode::Grouped,
+                                        "Duplicate groups",
+                                    );
+                                    ui.selectable_value(
+                                        &mut self.view_mode,
+                                        ViewMode::Pipeline,
+                                        "Pipeline shortlist",
+                                    );
+                                });
+                        });
+                    });
+                });
+
+                // Weights: the ranking criteria behind Overall, and the
+                // button that runs the pipeline with them.
+                ui.vertical(|ui| {
+                    ui.set_max_width(320.0);
+                    ui.group(|ui| {
+                        ui.strong("Ranking weights");
+                        ui.separator();
+
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "Overall = weighted blend of these factors, each \
+                                     0-100. Weights don't need to add to 100% -- \
+                                     they're renormalized over whatever's scored.",
+                                )
+                                .small(),
+                            )
+                            .wrap(),
+                        );
+                        let pct = |ui: &mut egui::Ui, label: &str, w: &mut f32, note: &str| {
+                            ui.label(label);
+                            let drag = ui.add(
+                                egui::DragValue::new(w)
+                                    .speed(0.01)
+                                    .range(0.0..=1.0)
+                                    .custom_formatter(|v, _| format!("{:.0}%", v * 100.0))
+                                    .custom_parser(|s| {
+                                        s.trim_end_matches('%').parse::<f64>().ok().map(|v| v / 100.0)
+                                    }),
+                            );
+                            if !note.is_empty() {
+                                drag.on_hover_text(note);
+                            }
+                            ui.end_row();
+                        };
+                        // Two 3-row sub-columns rather than one tall list --
+                        // reads more like a balanced table in the pane's
+                        // narrow third column. Explanatory notes (e.g. for
+                        // Composition/Subject) moved to a hover tooltip on
+                        // the value, since there's no room for them inline
+                        // at this width.
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                egui::Grid::new("weights-grid-left").num_columns(2).show(
+                                    ui,
+                                    |ui| {
+                                        pct(ui, "Sharpness", &mut self.weights.sharpness, "");
+                                        pct(ui, "Exposure", &mut self.weights.exposure, "");
+                                        pct(ui, "Contrast", &mut self.weights.contrast, "");
+                                    },
+                                );
+                            });
+                            ui.vertical(|ui| {
+                                egui::Grid::new("weights-grid-right").num_columns(2).show(
+                                    ui,
+                                    |ui| {
+                                        pct(ui, "Color", &mut self.weights.color, "");
+                                        pct(
+                                            ui,
+                                            "Composition",
+                                            &mut self.weights.composition,
+                                            "Rule-of-thirds heuristic",
+                                        );
+                                        pct(
+                                            ui,
+                                            "Subject",
+                                            &mut self.weights.subject,
+                                            "Portrait only: face prominence",
+                                        );
+                                    },
+                                );
+                            });
+                        });
+
+                        ui.add_space(4.0);
+
+                        let can_run = !self.entries.is_empty() && !self.scanning;
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(can_run, egui::Button::new("Rank now"))
+                                .clicked()
+                            {
+                                self.run_pipeline();
+                                self.view_mode = ViewMode::Pipeline;
+                            }
+                        });
+                    });
+                });
+            });
 
             if !self.errors.is_empty() {
                 ui.label(format!("{} files failed to decode", self.errors.len()));
