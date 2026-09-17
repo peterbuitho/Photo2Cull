@@ -22,3 +22,7 @@ cargo run --release
 ```
 
 Pick a folder, click Scan, then sort/filter/group as needed.
+
+## Hardware notes
+
+Scanning is CPU-parallelized (more cores = faster) and every photo's thumbnail stays resident as a GPU texture for the session. As a rough guide for a few thousand photos: 4+ cores, 8GB RAM, an SSD (RAW files mean a lot of reading), and any GPU from the last decade (no discrete GPU required -- expect roughly 200KB of VRAM per photo for thumbnails). Lower-spec machines will work, just more slowly, and very low RAM may see swapping on large RAW batches.
