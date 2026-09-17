@@ -63,6 +63,15 @@ jobs:
           chmod +x "$APP/Contents/MacOS/photo2cull"
           sed "s/__VERSION__/$VERSION/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
 
+          # Ad-hoc sign (no Apple Developer account/certificate needed).
+          # This isn't notarization -- Gatekeeper still shows an
+          # "unidentified developer" warning -- but it gives the .app a
+          # valid signature, which avoids the misleading "is damaged"
+          # rejection unsigned binaries get on newer macOS and restores
+          # the normal right-click "Open" bypass.
+          codesign --force --deep --sign - "$APP"
+          codesign --verify --verbose "$APP"
+
           # Stage the .app next to a symlink to /Applications so the .dmg
           # opens as the standard "drag to Applications" install UX.
           mkdir -p dmg-staging
