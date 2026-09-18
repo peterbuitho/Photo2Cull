@@ -1139,7 +1139,8 @@ impl eframe::App for Photo2CullApp {
 
                 ui.separator();
 
-                egui::ComboBox::from_label("Mode")
+                ui.label("Mode");
+                egui::ComboBox::from_id_salt("scan-mode")
                     .selected_text(match self.scan_mode {
                         ScanMode::Auto => "Auto".to_string(),
                         ScanMode::Fixed(m) => m.label().to_string(),
@@ -1151,7 +1152,8 @@ impl eframe::App for Photo2CullApp {
                         }
                     });
 
-                egui::ComboBox::from_label("Sharpness")
+                ui.label("Sharpness");
+                egui::ComboBox::from_id_salt("sharpness-method")
                     .selected_text(self.sharpness_method.label())
                     .show_ui(ui, |ui| {
                         for m in SharpnessMethod::ALL {
