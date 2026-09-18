@@ -6,12 +6,16 @@ A desktop app for quickly culling a folder of photos down to your keepers -- poi
 
 ## What it does
 
-- **Scans a folder** of RAW (via `rawler`) or standard photos (PNG, JPG, TIFF, BMP, WebP) and scores each one for focus sharpness (variance-of-Laplacian).
-- **Classifies each photo** as Landscape, Portrait, or Object, either automatically (ML face detection decides Portrait vs. a heuristic for the rest) or manually per photo, and rescoring adapts to the region that matters for that mode (e.g. the detected face for portraits).
-- **Ranks photos with an Overall score** blending six factors -- sharpness, exposure, contrast, color, composition (rule-of-thirds), and subject prominence (for portraits) -- with adjustable weights that re-rank instantly.
+- **Scans one or more folders** (subfolders included) of RAW (via `rawler`) or standard photos (PNG, JPG, TIFF, BMP, WebP) and scores each one for focus sharpness (variance-of-Laplacian).
+- **Classifies each photo** as Landscape, Portrait, Animal, or Object, either automatically (ML face detection decides Portrait, ML animal detection -- birds, cats, dogs, horses, cows and similar COCO animals -- decides Animal, and a heuristic handles the rest) or manually per photo, and rescoring adapts to the region that matters for that mode (e.g. the detected face or animal).
+- **Offers two ways to measure sharpness** when no face/animal is found: a fixed crop per photo type, or the sharpest tiles anywhere in the frame (better for macro and off-centre subjects).
+- **Zooms on hover**: rest the pointer on a thumbnail and a circular magnifier lens follows it, showing that part of the photo at a set zoom (Hover zoom pane: zoom percent, delay in seconds, and lens size). Double-click still opens the full-size viewer.
+- **Ranks photos with an Overall score** blending six factors -- sharpness, exposure, contrast, color, composition (rule-of-thirds), and subject prominence (for portraits and animals) -- with adjustable weights that re-rank instantly.
 - **Groups duplicates and bursts** using perceptual hashing, and flags the best-of-group pick by Overall score.
 - **Runs a full pipeline**: technical sharpness cull -> dedupe -> rank by Overall -> top-N shortlist, in one click.
-- **Moves disqualified photos** out of the way (into a `disqualified` subfolder) instead of deleting them, so culling stays reversible.
+- **Lets you override disqualification by hand**: photos at or below the threshold are marked automatically after a scan, and each photo has a "Disqualified" checkbox to mark or unmark it manually (manual choices survive threshold changes and count in the move and the ranking pipeline).
+- **Selects like Explorer**: click a thumbnail to select it, Ctrl+click to toggle, Shift+click for a range, Ctrl+A for everything shown, Esc to deselect. The Disqualified checkbox (or the Disqualify/Keep buttons) then applies to the whole selection.
+- **Moves disqualified photos** out of the way (into a `disqualified` subfolder of whichever chosen folder each photo came from, keeping its subfolder structure) instead of deleting them, so culling stays reversible.
 
 ## Getting started
 
@@ -21,7 +25,7 @@ Download a build from the [Releases](https://github.com/peterbuitho/Photo2Cull/r
 cargo run --release
 ```
 
-Pick a folder, click Scan, then sort/filter/group as needed.
+Add one or more folders, click Scan, then sort/filter/group as needed.
 
 ## Hardware notes
 

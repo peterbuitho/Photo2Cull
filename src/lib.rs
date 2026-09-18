@@ -1,3 +1,4 @@
+pub mod animal;
 pub mod app;
 pub mod classify;
 pub mod dedupe;

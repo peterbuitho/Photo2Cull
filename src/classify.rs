@@ -105,7 +105,7 @@ fn iou(a: [f32; 4], b: [f32; 4]) -> f32 {
     inter / (area_a + area_b - inter + 1e-5)
 }
 
-fn nms(mut candidates: Vec<(f32, [f32; 4])>) -> Vec<(f32, [f32; 4])> {
+pub(crate) fn nms(mut candidates: Vec<(f32, [f32; 4])>) -> Vec<(f32, [f32; 4])> {
     candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
     let mut kept: Vec<(f32, [f32; 4])> = Vec::new();
     for (score, b) in candidates {

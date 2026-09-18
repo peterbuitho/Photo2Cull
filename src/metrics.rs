@@ -22,18 +22,20 @@
 //!   against thirds-alignment in a single blended number (a centered,
 //!   symmetric subject is the *opposite* of a thirds-aligned one), so
 //!   combining them produced a score that mostly cancelled itself out.
-//! - Subject quality scores face prominence (size + centering) for
-//!   Portraits only. The planned eyes-open check would need sourcing a
-//!   second ONNX model with the same license/verification rigor as the
-//!   face detector; deferred rather than rushed.
+//! - Subject quality scores subject prominence (size + centering) for
+//!   Portraits (face) and Animals (detected animal) only. The planned
+//!   eyes-open check would need sourcing a second ONNX model with the same
+//!   license/verification rigor as the face detector; deferred rather than
+//!   rushed.
 
 use image::{GrayImage, RgbImage};
 
 use crate::classify::FaceBox;
 
 /// Per-photo factor scores, each normalized to roughly 0-100 (higher is
-/// better). `subject` is `None` for non-Portraits (no well-defined subject
-/// without a general object detector); `overall_score` renormalizes over
+/// better). `subject` is `None` unless a face (Portrait) or animal (Animal)
+/// was detected (no well-defined subject otherwise); `overall_score`
+/// renormalizes over
 /// whatever's present.
 #[derive(Debug, Clone, Copy)]
 pub struct Metrics {
@@ -101,15 +103,16 @@ pub fn overall_score(m: &Metrics, w: &Weights) -> f64 {
 }
 
 /// Compute every factor from an already-decoded photo, given its raw
-/// (absolute) sharpness score and, for Portraits, the detected main face.
-pub fn compute(rgb: &RgbImage, raw_sharpness: f64, face: Option<&FaceBox>) -> Metrics {
+/// (absolute) sharpness score and, for Portraits/Animals, the detected main
+/// subject box.
+pub fn compute(rgb: &RgbImage, raw_sharpness: f64, subject: Option<&FaceBox>) -> Metrics {
     Metrics {
         sharpness: normalize_sharpness(raw_sharpness),
         exposure: exposure_score(rgb),
         contrast: contrast_score(rgb),
         color: color_score(rgb),
         composition: Some(composition_score(rgb)),
-        subject: face.map(|f| subject_quality_score(f, rgb.width(), rgb.height())),
+        subject: subject.map(|b| subject_quality_score(b, rgb.width(), rgb.height())),
     }
 }
 

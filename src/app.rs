@@ -1,14 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use egui::{ColorImage, TextureHandle, TextureOptions};
 
 use crate::dedupe::group_duplicates;
 use crate::metrics::{Metrics, Weights, overall_score};
-use crate::scan::{DISQUALIFIED_DIR, RecomputeEvent, ScanEvent, ScanMode, run_recompute, run_scan};
-use crate::sharpness::PhotoMode;
+use crate::scan::{
+    DISQUALIFIED_DIR, RecomputeEvent, ScanEvent, ScanMode, disqualified_path_for, run_recompute,
+    run_scan,
+};
+use crate::sharpness::{PhotoMode, SharpnessMethod};
 
 /// Fixed square thumbnail slot on the left of each photo card. Fixed rather
 /// than sized to the image's own aspect ratio so the info column to its
@@ -60,6 +64,10 @@ struct PhotoEntry {
     /// (and `metrics`) was last computed for it -- i.e. the values shown
     /// are stale.
     dirty: bool,
+    /// The user's manual mark (`Some(true)`) or unmark (`Some(false)`) of
+    /// this photo as disqualified, overriding the score threshold. `None`
+    /// follows the threshold (see `Photo2CullApp::is_disqualified`).
+    manual_dq: Option<bool>,
     texture: TextureHandle,
 }
 
@@ -103,6 +111,25 @@ enum SortBy {
 /// to judge focus at full-window size.
 const PREVIEW_MAX_DIM: usize = 2400;
 
+/// Image cap for the hover-zoom lens: much sharper than the 220px thumbnail
+/// (which would just turn to mush when magnified), but cheaper to decode
+/// than the full-size viewer's `PREVIEW_MAX_DIM`.
+const HOVER_ZOOM_MAX_DIM: usize = 1200;
+/// Decoded hover-zoom textures kept around so re-hovering a photo is instant.
+const HOVER_ZOOM_CACHE: usize = 8;
+/// Vertices around the lens rim; enough that the circle looks smooth.
+const LENS_SEGMENTS: usize = 64;
+
+/// The thumbnail the pointer is currently resting on.
+struct HoverZoom {
+    path: PathBuf,
+    /// The card's thumbnail, magnified until the sharper image loads.
+    thumb: TextureHandle,
+    /// Where the (aspect-fitted) thumbnail is on screen.
+    thumb_rect: egui::Rect,
+    since: Instant,
+}
+
 struct Viewer {
     path: PathBuf,
     /// `None` while the full-size decode is still in flight.
@@ -128,8 +155,18 @@ enum MoveEvent {
 }
 
 pub struct Photo2CullApp {
-    root: Option<PathBuf>,
+    /// Folders chosen for the next scan.
+    roots: Vec<PathBuf>,
+    /// Folders the current results were scanned from. Kept separate from
+    /// `roots` so editing the list after a scan doesn't change where
+    /// disqualified photos are moved to.
+    scanned_roots: Vec<PathBuf>,
     scan_mode: ScanMode,
+    /// How sharpness is measured for the next scan.
+    sharpness_method: SharpnessMethod,
+    /// Method the current results were scored with; recalculation reuses it
+    /// so type overrides stay comparable with the rest of the scan.
+    scanned_method: SharpnessMethod,
     entries: Vec<PhotoEntry>,
     errors: Vec<(PathBuf, String)>,
     total_found: usize,
@@ -140,6 +177,30 @@ pub struct Photo2CullApp {
     recomputing: bool,
     cull_threshold: f64,
     viewer: Option<Viewer>,
+    /// Magnifier lens strength, in percent of the thumbnail's on-screen size.
+    zoom_percent: f32,
+    /// Seconds the pointer must rest on a thumbnail before the lens shows.
+    zoom_delay_secs: f32,
+    /// On-screen diameter of the magnifier lens, in points.
+    lens_diameter: f32,
+    /// Photos selected in the grid (click / Ctrl+click / Shift+click, like
+    /// files in Explorer). Keyed by path so it survives moves and re-sorts.
+    selection: HashSet<PathBuf>,
+    /// The photo a Shift+click range extends from.
+    selection_anchor: Option<PathBuf>,
+    /// Entry indices in the order the cards were drawn last frame, across
+    /// whichever view is showing; what a Shift+click range walks over.
+    visible_order: Vec<usize>,
+    /// The same, being built up during the current frame.
+    visible_order_next: Vec<usize>,
+    hover_zoom: Option<HoverZoom>,
+    /// Set by `photo_card` whenever a thumbnail is hovered this frame, so
+    /// `show_hover_zoom` can tell when the pointer has left them all.
+    hover_zoom_seen: bool,
+    zoom_cache: Vec<(PathBuf, TextureHandle)>,
+    zoom_loading: HashSet<PathBuf>,
+    zoom_tx: Sender<PreviewEvent>,
+    zoom_rx: Receiver<PreviewEvent>,
     preview_rx: Option<Receiver<PreviewEvent>>,
     moving: bool,
     move_rx: Option<Receiver<MoveEvent>>,
@@ -164,9 +225,13 @@ pub struct Photo2CullApp {
 
 impl Photo2CullApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+        let (zoom_tx, zoom_rx) = channel();
         Self {
-            root: None,
+            roots: Vec::new(),
+            scanned_roots: Vec::new(),
             scan_mode: ScanMode::Auto,
+            sharpness_method: SharpnessMethod::FixedRegion,
+            scanned_method: SharpnessMethod::FixedRegion,
             entries: Vec::new(),
             errors: Vec::new(),
             total_found: 0,
@@ -177,6 +242,19 @@ impl Photo2CullApp {
             recomputing: false,
             cull_threshold: 32.0,
             viewer: None,
+            zoom_percent: 800.0,
+            zoom_delay_secs: 1.2,
+            lens_diameter: 300.0,
+            selection: HashSet::new(),
+            selection_anchor: None,
+            visible_order: Vec::new(),
+            visible_order_next: Vec::new(),
+            hover_zoom: None,
+            hover_zoom_seen: false,
+            zoom_cache: Vec::new(),
+            zoom_loading: HashSet::new(),
+            zoom_tx,
+            zoom_rx,
             preview_rx: None,
             moving: false,
             move_rx: None,
@@ -205,17 +283,16 @@ impl Photo2CullApp {
         self.groups = group_duplicates(&photos, self.group_threshold);
     }
 
-    /// The full funnel: drop photos at or below the sharpness cull
-    /// threshold, cluster survivors into duplicate/burst groups and keep
+    /// The full funnel: drop disqualified photos (at or below the sharpness
+    /// cull threshold, or manually marked), cluster survivors into duplicate/burst groups and keep
     /// only the highest-Overall member of each (plus any ungrouped
     /// singletons), then rank the rest by Overall and keep the top N.
     /// Cheap enough (same cost as `compute_groups` plus a sort) to run
     /// synchronously from a button click.
     fn run_pipeline(&mut self) {
         let total = self.entries.len();
-        let cutoff = self.cull_threshold;
         let survivors: Vec<usize> = (0..total)
-            .filter(|&i| self.entries[i].score > cutoff)
+            .filter(|&i| !self.is_disqualified(&self.entries[i]))
             .collect();
         let after_technical = survivors.len();
 
@@ -266,23 +343,21 @@ impl Photo2CullApp {
         });
     }
 
-    /// Move every currently-flagged (likely out of focus) photo into a
-    /// `disqualified` subfolder of the scanned root, in the background.
+    /// Move every currently-disqualified photo into a
+    /// `disqualified` subfolder of the scanned folder each one came from
+    /// (keeping its subfolder structure), in the background.
     fn start_move_disqualified(&mut self) {
         if self.moving {
             return;
         }
-        let Some(root) = self.root.clone() else {
-            return;
-        };
-        let Some(cutoff) = self.cull_cutoff() else {
-            return;
-        };
-        let items: Vec<PathBuf> = self
+        let items: Vec<(PathBuf, PathBuf)> = self
             .entries
             .iter()
-            .filter(|e| e.score <= cutoff)
-            .map(|e| e.path.clone())
+            .filter(|e| self.is_disqualified(e))
+            .filter_map(|e| {
+                disqualified_path_for(&self.scanned_roots, &e.path)
+                    .map(|dest| (e.path.clone(), dest))
+            })
             .collect();
         if items.is_empty() {
             return;
@@ -294,22 +369,18 @@ impl Photo2CullApp {
         self.move_status = None;
         let (tx, rx) = channel();
         self.move_rx = Some(rx);
-        let dest_dir = root.join(DISQUALIFIED_DIR);
         thread::spawn(move || {
-            if let Err(e) = std::fs::create_dir_all(&dest_dir) {
-                for path in items {
-                    let _ = tx.send(MoveEvent::Failed(
-                        path,
-                        format!("couldn't create {}: {e}", dest_dir.display()),
-                    ));
-                }
-                let _ = tx.send(MoveEvent::Done);
-                return;
-            }
-            for path in items {
-                let result = match path.file_name() {
-                    Some(name) => std::fs::rename(&path, dest_dir.join(name)),
-                    None => Err(std::io::Error::other("photo path has no file name")),
+            for (path, dest) in items {
+                let result = match dest.parent() {
+                    Some(dir) => std::fs::create_dir_all(dir)
+                        .map_err(|e| {
+                            std::io::Error::other(format!(
+                                "couldn't create {}: {e}",
+                                dir.display()
+                            ))
+                        })
+                        .and_then(|()| std::fs::rename(&path, &dest)),
+                    None => Err(std::io::Error::other("photo path has no parent folder")),
                 };
                 let _ = tx.send(match result {
                     Ok(()) => MoveEvent::Moved(path),
@@ -329,6 +400,9 @@ impl Photo2CullApp {
             match event {
                 MoveEvent::Moved(path) => {
                     self.entries.retain(|e| e.path != path);
+                    self.selection.remove(&path);
+                    // Entry indices shifted; a stale order would mis-select.
+                    self.visible_order.clear();
                     self.move_moved += 1;
                 }
                 MoveEvent::Failed(path, err) => {
@@ -410,9 +484,16 @@ impl Photo2CullApp {
     }
 
     fn start_scan(&mut self) {
-        let Some(root) = self.root.clone() else {
+        if self.roots.is_empty() {
             return;
-        };
+        }
+        let roots = self.roots.clone();
+        self.scanned_roots = roots.clone();
+        self.hover_zoom = None;
+        self.zoom_cache.clear();
+        self.selection.clear();
+        self.selection_anchor = None;
+        self.visible_order.clear();
         self.entries.clear();
         self.errors.clear();
         self.total_found = 0;
@@ -425,7 +506,9 @@ impl Photo2CullApp {
         let (tx, rx) = channel();
         self.rx = Some(rx);
         let scan_mode = self.scan_mode;
-        thread::spawn(move || run_scan(root, scan_mode, tx));
+        let method = self.sharpness_method;
+        self.scanned_method = method;
+        thread::spawn(move || run_scan(roots, scan_mode, method, tx));
     }
 
     /// Re-score every entry whose type was manually changed since its last
@@ -446,7 +529,8 @@ impl Photo2CullApp {
         self.recomputing = true;
         let (tx, rx) = channel();
         self.recompute_rx = Some(rx);
-        thread::spawn(move || run_recompute(items, tx));
+        let method = self.scanned_method;
+        thread::spawn(move || run_recompute(items, method, tx));
     }
 
     fn drain_events(&mut self, ctx: &egui::Context) {
@@ -473,6 +557,7 @@ impl Photo2CullApp {
                             metrics: p.metrics,
                             phash: p.phash,
                             dirty: false,
+                            manual_dq: None,
                             texture,
                         });
                     }
@@ -508,6 +593,140 @@ impl Photo2CullApp {
                 self.recompute_rx = None;
             }
         }
+    }
+
+    /// Decode `path` at hover-zoom size in the background; the result comes
+    /// back over `zoom_rx` and is cached by `drain_zoom`.
+    fn start_zoom_load(&mut self, path: PathBuf) {
+        if !self.zoom_loading.insert(path.clone()) {
+            return;
+        }
+        let tx = self.zoom_tx.clone();
+        thread::spawn(move || {
+            let event = match crate::photo::decode_photo(&path, HOVER_ZOOM_MAX_DIM) {
+                Ok(img) => PreviewEvent::Loaded {
+                    path,
+                    w: img.width(),
+                    h: img.height(),
+                    rgb: img.into_raw(),
+                },
+                Err(_) => PreviewEvent::Failed { path },
+            };
+            let _ = tx.send(event);
+        });
+    }
+
+    fn drain_zoom(&mut self, ctx: &egui::Context) {
+        while let Ok(event) = self.zoom_rx.try_recv() {
+            match event {
+                PreviewEvent::Loaded { path, w, h, rgb } => {
+                    self.zoom_loading.remove(&path);
+                    let image = ColorImage::from_rgb([w as usize, h as usize], &rgb);
+                    let texture = ctx.load_texture(
+                        format!("hover-zoom-{}", path.display()),
+                        image,
+                        TextureOptions::LINEAR,
+                    );
+                    if self.zoom_cache.len() >= HOVER_ZOOM_CACHE {
+                        drop(self.zoom_cache.remove(0));
+                    }
+                    self.zoom_cache.push((path, texture));
+                }
+                // Left in `zoom_loading` so a photo that fails to decode
+                // isn't retried on every frame of the hover.
+                PreviewEvent::Failed { .. } => {}
+            }
+        }
+    }
+
+    /// Track which thumbnail (if any) the pointer has rested on, and once
+    /// it has been there for `zoom_delay_secs` draw a circular magnifier
+    /// lens centred on the pointer, showing the part of the photo under it
+    /// at `zoom_percent`. Called once per frame after the cards are drawn.
+    fn show_hover_zoom(&mut self, ctx: &egui::Context) {
+        let hovering = std::mem::take(&mut self.hover_zoom_seen);
+        if !hovering || self.viewer.is_some() {
+            self.hover_zoom = None;
+            return;
+        }
+        let Some(hover) = &self.hover_zoom else {
+            return;
+        };
+        let Some(pointer) = ctx.pointer_hover_pos() else {
+            return;
+        };
+
+        let delay = Duration::from_secs_f32(self.zoom_delay_secs.max(0.0));
+        let waited = hover.since.elapsed();
+        if waited < delay {
+            // A still pointer produces no input events, so ask for the
+            // repaint that will notice the delay has elapsed.
+            ctx.request_repaint_after(delay - waited);
+            return;
+        }
+
+        let path = hover.path.clone();
+        let thumb = hover.thumb.clone();
+        let thumb_rect = hover.thumb_rect;
+        let cached = self
+            .zoom_cache
+            .iter()
+            .find(|(p, _)| *p == path)
+            .map(|(_, t)| t.clone());
+        if cached.is_none() {
+            self.start_zoom_load(path);
+            // The decode thread can't wake the UI, so poll for its result.
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        let texture = cached.unwrap_or(thumb);
+
+        let zoom = (self.zoom_percent / 100.0).max(1.0);
+        let radius = self.lens_diameter / 2.0;
+        let size = thumb_rect.size();
+        // How much of the image (as a 0..1 fraction of each axis) the lens
+        // shows.
+        let half_uv = egui::vec2(radius / (zoom * size.x), radius / (zoom * size.y));
+        // Keep the visible window inside the image, so near an edge the lens
+        // shows the edge rather than smearing stretched border pixels.
+        let clamp_axis = |v: f32, half: f32| {
+            if half >= 0.5 {
+                0.5
+            } else {
+                v.clamp(half, 1.0 - half)
+            }
+        };
+        let center_uv = egui::pos2(
+            clamp_axis((pointer.x - thumb_rect.left()) / size.x, half_uv.x),
+            clamp_axis((pointer.y - thumb_rect.top()) / size.y, half_uv.y),
+        );
+
+        let mut mesh = egui::Mesh::with_texture(texture.id());
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: pointer,
+            uv: center_uv,
+            color: egui::Color32::WHITE,
+        });
+        for i in 0..=LENS_SEGMENTS {
+            let angle = i as f32 / LENS_SEGMENTS as f32 * std::f32::consts::TAU;
+            let dir = egui::vec2(angle.cos(), angle.sin());
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: pointer + dir * radius,
+                uv: center_uv + dir * half_uv,
+                color: egui::Color32::WHITE,
+            });
+            if i > 0 {
+                mesh.add_triangle(0, i as u32, i as u32 + 1);
+            }
+        }
+
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Tooltip,
+            egui::Id::new("hover-lens"),
+        ));
+        painter.circle_filled(pointer, radius + 2.0, egui::Color32::BLACK);
+        painter.add(egui::Shape::mesh(mesh));
+        painter.circle_stroke(pointer, radius, egui::Stroke::new(2.0, egui::Color32::WHITE));
+        ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
     }
 
     fn show_viewer(&mut self, ctx: &egui::Context) {
@@ -557,14 +776,64 @@ impl Photo2CullApp {
         }
     }
 
-    /// Score below which entries are flagged. `None` while there's nothing
-    /// scanned yet, so nothing shows as flagged before there's data.
-    fn cull_cutoff(&self) -> Option<f64> {
-        if self.entries.is_empty() {
-            None
-        } else {
-            Some(self.cull_threshold)
+    /// Apply an Explorer-style click on the card at `idx`: a plain click
+    /// selects just it, Ctrl/Cmd+click toggles it, Shift+click selects the
+    /// range from the anchor to it (added to the selection with Ctrl too).
+    fn select_click(&mut self, idx: usize, mods: egui::Modifiers) {
+        let path = self.entries[idx].path.clone();
+
+        if mods.shift {
+            let position = |order: &[usize], entries: &[PhotoEntry], p: &PathBuf| {
+                order.iter().position(|&i| entries[i].path == *p)
+            };
+            let from = self
+                .selection_anchor
+                .as_ref()
+                .and_then(|a| position(&self.visible_order, &self.entries, a));
+            let to = position(&self.visible_order, &self.entries, &path);
+            if let (Some(a), Some(b)) = (from, to) {
+                if !mods.command {
+                    self.selection.clear();
+                }
+                let (lo, hi) = (a.min(b), a.max(b));
+                for &i in &self.visible_order[lo..=hi] {
+                    self.selection.insert(self.entries[i].path.clone());
+                }
+                return;
+            }
         }
+
+        if mods.command {
+            if !self.selection.remove(&path) {
+                self.selection.insert(path.clone());
+            }
+        } else {
+            self.selection.clear();
+            self.selection.insert(path.clone());
+        }
+        self.selection_anchor = Some(path);
+    }
+
+    /// Mark (`true`) or unmark (`false`) every selected photo as
+    /// disqualified by hand. A photo whose new state matches what the score
+    /// threshold gives goes back to following the threshold.
+    fn set_selected_disqualified(&mut self, dq: bool) {
+        let threshold = self.cull_threshold;
+        for e in &mut self.entries {
+            if self.selection.contains(&e.path) {
+                e.manual_dq = (dq != (e.score <= threshold)).then_some(dq);
+            }
+        }
+    }
+
+    /// Whether `entry` is currently disqualified: the user's manual mark or
+    /// unmark if they made one, otherwise whether its score is at or below
+    /// the cull threshold (so photos below the limit are marked
+    /// automatically after a scan, and follow the threshold as it changes).
+    fn is_disqualified(&self, entry: &PhotoEntry) -> bool {
+        entry
+            .manual_dq
+            .unwrap_or(entry.score <= self.cull_threshold)
     }
 
     /// (min, max) score across all entries, for the threshold input's hint.
@@ -575,9 +844,10 @@ impl Photo2CullApp {
     }
 
     /// One photo card: thumbnail (double-click to open the full-size
-    /// preview) on the left, with filename (red if `flagged`), the type
-    /// dropdown, the absolute sharpness score, and the Overall score
-    /// stacked in a column to its right. Shared by the flat grid and the
+    /// preview) on the left, with filename (red if disqualified), the type
+    /// dropdown, the absolute sharpness score, the Overall score, and a
+    /// checkbox to manually mark/unmark the photo as disqualified, stacked
+    /// in a column to its right. Shared by the flat grid and the
     /// duplicate-groups view so they can't drift apart. `badge`, if given,
     /// is drawn as a colored label under the filename (e.g. marking the
     /// best-of-group pick). The thumbnail sits in a fixed-size square slot
@@ -588,11 +858,10 @@ impl Photo2CullApp {
         &mut self,
         ui: &mut egui::Ui,
         idx: usize,
-        flagged: bool,
         badge: Option<(egui::Color32, &str)>,
         open_request: &mut Option<PathBuf>,
     ) {
-        ui.group(|ui| {
+        let card = ui.group(|ui| {
             ui.horizontal_top(|ui| {
                 let entry = &self.entries[idx];
                 let size = entry.texture.size_vec2();
@@ -601,12 +870,52 @@ impl Photo2CullApp {
                 let (slot_rect, _) =
                     ui.allocate_exact_size(egui::vec2(THUMB_BOX, THUMB_BOX), egui::Sense::hover());
                 let image_rect = egui::Rect::from_center_size(slot_rect.center(), img_size);
+                // Disqualified photos are dimmed a little (60%) and struck through
+                // with a red diagonal: the line keeps the photo readable (you
+                // may be checking whether it was wrongly disqualified), the
+                // dim makes the whole grid scannable at a glance.
+                let disqualified = self.is_disqualified(entry);
+                let tint = if disqualified {
+                    egui::Color32::from_gray(153)
+                } else {
+                    egui::Color32::WHITE
+                };
                 let image_response = ui.put(
                     image_rect,
-                    egui::Image::new((entry.texture.id(), img_size)).sense(egui::Sense::click()),
+                    egui::Image::new((entry.texture.id(), img_size))
+                        .tint(tint)
+                        .sense(egui::Sense::click()),
                 );
+                if disqualified {
+                    ui.painter().line_segment(
+                        [image_rect.right_top(), image_rect.left_bottom()],
+                        egui::Stroke::new(
+                            3.0,
+                            egui::Color32::from_rgba_unmultiplied(220, 60, 60, 210),
+                        ),
+                    );
+                }
                 if image_response.double_clicked() {
                     *open_request = Some(entry.path.clone());
+                }
+                if image_response.hovered() {
+                    let (path, thumb) = (entry.path.clone(), entry.texture.clone());
+                    self.hover_zoom_seen = true;
+                    match &mut self.hover_zoom {
+                        Some(h) if h.path == path => h.thumb_rect = image_rect,
+                        _ => {
+                            self.hover_zoom = Some(HoverZoom {
+                                path,
+                                thumb,
+                                thumb_rect: image_rect,
+                                since: Instant::now(),
+                            });
+                        }
+                    }
+                }
+                if image_response.clicked() {
+                    let mods = ui.input(|i| i.modifiers);
+                    self.select_click(idx, mods);
                 }
 
                 ui.vertical(|ui| {
@@ -617,7 +926,7 @@ impl Photo2CullApp {
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
                         .unwrap_or_default();
-                    if flagged {
+                    if self.is_disqualified(entry) {
                         ui.colored_label(egui::Color32::from_rgb(220, 90, 90), name);
                     } else {
                         ui.label(name);
@@ -653,36 +962,73 @@ impl Photo2CullApp {
                         let overall = overall_score(&self.entries[idx].metrics, &self.weights);
                         ui.small(format!("overall: {overall:.0}"));
                     }
+
+                    let entry = &self.entries[idx];
+                    let auto_dq = entry.score <= self.cull_threshold;
+                    let manual = entry.manual_dq.is_some();
+                    let mut dq = self.is_disqualified(entry);
+                    let response = ui.checkbox(
+                        &mut dq,
+                        if manual { "Disqualified*" } else { "Disqualified" },
+                    );
+                    if manual {
+                        response.clone().on_hover_text(
+                            "Set manually (overrides the score threshold). Click to \
+                             go back to following the threshold if it now agrees.",
+                        );
+                    }
+                    if response.changed() {
+                        if self.selection.contains(&self.entries[idx].path) {
+                            // Like Explorer: acting on one selected item acts
+                            // on the whole selection.
+                            self.set_selected_disqualified(dq);
+                        } else {
+                            // Back in line with the threshold -> stop
+                            // overriding it.
+                            self.entries[idx].manual_dq = (dq != auto_dq).then_some(dq);
+                        }
+                    }
                 });
             });
         });
+        if self.selection.contains(&self.entries[idx].path) {
+            let accent = ui.visuals().selection.stroke.color;
+            let painter = ui.painter();
+            painter.rect_filled(
+                card.response.rect,
+                4.0,
+                egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 28),
+            );
+            painter.rect_stroke(
+                card.response.rect,
+                4.0,
+                egui::Stroke::new(2.5, accent),
+                egui::StrokeKind::Outside,
+            );
+        }
     }
 
     /// Lay `indices` out as chunked (non-wrapping) rows of `photo_card`s --
     /// see the note on `horizontal_wrapped` corruption where this pattern
     /// is used in the flat grid for why it's not just `horizontal_wrapped`.
-    /// `cutoff`, if given, flags (red name) entries scoring at or below it
-    /// -- used by the flat grid, not the groups view. `best_idx`, if given,
-    /// badges that one entry -- used by the groups view, not the flat grid.
+    /// `best_idx`, if given, badges that one entry -- used by the groups
+    /// view, not the flat grid.
     fn photo_row_grid(
         &mut self,
         ui: &mut egui::Ui,
         indices: &[usize],
-        cutoff: Option<f64>,
         best_idx: Option<usize>,
         open_request: &mut Option<PathBuf>,
     ) {
+        self.visible_order_next.extend_from_slice(indices);
         let spacing = ui.spacing().item_spacing.x;
         let columns = ((ui.available_width() / (CARD_WIDTH + spacing)).floor() as usize).max(1);
         for row in indices.chunks(columns) {
             ui.horizontal(|ui| {
                 for &idx in row {
-                    let flagged = cutoff
-                        .map(|c| self.entries[idx].score <= c)
-                        .unwrap_or(false);
                     let badge = (Some(idx) == best_idx)
                         .then_some((egui::Color32::from_rgb(90, 170, 90), "★ best of group"));
-                    self.photo_card(ui, idx, flagged, badge, open_request);
+                    self.photo_card(ui, idx, badge, open_request);
                 }
             });
         }
@@ -728,7 +1074,7 @@ impl Photo2CullApp {
                     });
 
                     ui.label(format!("Group {} ({} photos)", gi + 1, indices.len()));
-                    self.photo_row_grid(ui, &indices, None, best_idx, open_request);
+                    self.photo_row_grid(ui, &indices, best_idx, open_request);
                     ui.separator();
                 }
             });
@@ -742,10 +1088,9 @@ impl Photo2CullApp {
             return;
         };
         let summary = format!(
-            "{} photos → {} after technical filter (score > {:.0}) → {} after dedupe → top {} shown",
+            "{} photos → {} after removing disqualified → {} after dedupe → top {} shown",
             result.total,
             result.after_technical,
-            self.cull_threshold,
             result.after_dedupe,
             result.shortlist.len()
         );
@@ -755,7 +1100,7 @@ impl Photo2CullApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                self.photo_row_grid(ui, &shortlist, None, None, open_request);
+                self.photo_row_grid(ui, &shortlist, None, open_request);
             });
     }
 }
@@ -765,6 +1110,7 @@ impl eframe::App for Photo2CullApp {
         let ctx = ui.ctx().clone();
         self.drain_events(&ctx);
         self.drain_preview(&ctx);
+        self.drain_zoom(&ctx);
         self.drain_move();
         if self.scanning
             || self.recomputing
@@ -776,18 +1122,19 @@ impl eframe::App for Photo2CullApp {
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal(|ui| {
-                if ui.button("Choose folder…").clicked()
-                    && let Some(folder) = rfd::FileDialog::new().pick_folder()
+                if ui.button("Add folders…").clicked()
+                    && let Some(folders) = rfd::FileDialog::new().pick_folders()
                 {
-                    self.root = Some(folder);
+                    for folder in folders {
+                        if !self.roots.contains(&folder) {
+                            self.roots.push(folder);
+                        }
+                    }
                 }
-                match &self.root {
-                    Some(p) => {
-                        ui.label(p.display().to_string());
-                    }
-                    None => {
-                        ui.label("No folder selected");
-                    }
+                if self.roots.is_empty() {
+                    ui.label("No folder selected");
+                } else if ui.button("Clear").clicked() {
+                    self.roots.clear();
                 }
 
                 ui.separator();
@@ -804,9 +1151,23 @@ impl eframe::App for Photo2CullApp {
                         }
                     });
 
+                egui::ComboBox::from_label("Sharpness")
+                    .selected_text(self.sharpness_method.label())
+                    .show_ui(ui, |ui| {
+                        for m in SharpnessMethod::ALL {
+                            ui.selectable_value(&mut self.sharpness_method, m, m.label())
+                                .on_hover_text(m.description());
+                        }
+                    })
+                    .response
+                    .on_hover_text(self.sharpness_method.description());
+                if self.sharpness_method != self.scanned_method && !self.entries.is_empty() {
+                    ui.small("(applies on next Scan)");
+                }
+
                 ui.separator();
 
-                let can_scan = self.root.is_some() && !self.scanning;
+                let can_scan = !self.roots.is_empty() && !self.scanning;
                 let scan_label = if can_scan {
                     egui::RichText::new("Scan")
                         .strong()
@@ -851,12 +1212,32 @@ impl eframe::App for Photo2CullApp {
                     ));
                 }
             });
+
+            if !self.roots.is_empty() {
+                let mut remove = None;
+                ui.horizontal_wrapped(|ui| {
+                    for (i, folder) in self.roots.iter().enumerate() {
+                        if ui
+                            .small_button("✕")
+                            .on_hover_text("Remove this folder")
+                            .clicked()
+                        {
+                            remove = Some(i);
+                        }
+                        ui.label(folder.display().to_string());
+                        ui.add_space(8.0);
+                    }
+                });
+                if let Some(i) = remove {
+                    self.roots.remove(i);
+                }
+            }
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
             if self.entries.is_empty() {
                 ui.label(
-                    "Pick a folder and click Scan to check focus sharpness across your photos (RAW, PNG, JPG, TIFF, BMP, WebP).",
+                    "Add one or more folders and click Scan to check focus sharpness across your photos (RAW, PNG, JPG, TIFF, BMP, WebP).",
                 );
                 if !self.errors.is_empty() {
                     ui.label(format!("{} files failed to decode", self.errors.len()));
@@ -864,10 +1245,12 @@ impl eframe::App for Photo2CullApp {
                 return;
             }
 
-            let cutoff = self.cull_cutoff();
-            let flagged_count = cutoff
-                .map(|c| self.entries.iter().filter(|e| e.score <= c).count())
-                .unwrap_or(0);
+            let flagged_count = self
+                .entries
+                .iter()
+                .filter(|e| self.is_disqualified(e))
+                .count();
+            let manual_count = self.entries.iter().filter(|e| e.manual_dq.is_some()).count();
             let dirty_count = self.entries.iter().filter(|e| e.dirty).count();
 
             // Three sections, each capped to a modest max width rather than
@@ -901,6 +1284,34 @@ impl eframe::App for Photo2CullApp {
                         });
                         if let Some((min, max)) = self.score_range() {
                             ui.small(format!("(scanned scores range {min:.0}–{max:.0})"));
+                        }
+
+                        if !self.selection.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.small(format!("{} selected:", self.selection.len()));
+                                if ui.small_button("Disqualify").clicked() {
+                                    self.set_selected_disqualified(true);
+                                }
+                                if ui.small_button("Keep").clicked() {
+                                    self.set_selected_disqualified(false);
+                                }
+                                if ui.small_button("Deselect").clicked() {
+                                    self.selection.clear();
+                                }
+                            });
+                        }
+                        if manual_count > 0
+                            && ui
+                                .small_button(format!("Clear {manual_count} manual marks"))
+                                .on_hover_text(
+                                    "Go back to the score threshold for every photo you \
+                                     marked or unmarked by hand",
+                                )
+                                .clicked()
+                        {
+                            for e in &mut self.entries {
+                                e.manual_dq = None;
+                            }
                         }
 
                         ui.add_space(4.0);
@@ -1110,7 +1521,7 @@ impl eframe::App for Photo2CullApp {
                                             ui,
                                             "Subject",
                                             &mut self.weights.subject,
-                                            "Portrait only: face prominence",
+                                            "Portrait/Animal: subject prominence",
                                         );
                                     },
                                 );
@@ -1129,6 +1540,49 @@ impl eframe::App for Photo2CullApp {
                                 self.view_mode = ViewMode::Pipeline;
                             }
                         });
+                    });
+                });
+
+                // Hover zoom: a magnifier lens over the thumbnail under the
+                // pointer, for judging focus without opening the full-size
+                // viewer.
+                ui.vertical(|ui| {
+                    ui.set_max_width(col_width);
+                    ui.group(|ui| {
+                        ui.strong("Hover zoom");
+                        ui.separator();
+
+                        ui.horizontal(|ui| {
+                            ui.label("Zoom");
+                            ui.add(
+                                egui::DragValue::new(&mut self.zoom_percent)
+                                    .speed(5.0)
+                                    .range(100.0..=1000.0)
+                                    .max_decimals(0)
+                                    .suffix("%"),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Delay");
+                            ui.add(
+                                egui::DragValue::new(&mut self.zoom_delay_secs)
+                                    .speed(0.1)
+                                    .range(0.0..=10.0)
+                                    .max_decimals(1)
+                                    .suffix(" s"),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Size");
+                            ui.add(
+                                egui::DragValue::new(&mut self.lens_diameter)
+                                    .speed(2.0)
+                                    .range(60.0..=500.0)
+                                    .max_decimals(0)
+                                    .suffix(" px"),
+                            );
+                        });
+                        ui.small("(rest the pointer on a thumbnail for the delay to show the lens)");
                     });
                 });
             });
@@ -1166,7 +1620,7 @@ impl eframe::App for Photo2CullApp {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            self.photo_row_grid(ui, &order, cutoff, None, &mut open_request);
+                            self.photo_row_grid(ui, &order, None, &mut open_request);
                         });
                 }
                 ViewMode::Grouped => {
@@ -1182,6 +1636,28 @@ impl eframe::App for Photo2CullApp {
             }
         });
 
+        self.visible_order = std::mem::take(&mut self.visible_order_next);
+
+        if !ctx.egui_wants_keyboard_input() {
+            let (select_all, escape) = ctx.input(|i| {
+                (
+                    i.modifiers.command && i.key_pressed(egui::Key::A),
+                    i.key_pressed(egui::Key::Escape),
+                )
+            });
+            if select_all {
+                self.selection = self
+                    .visible_order
+                    .iter()
+                    .map(|&i| self.entries[i].path.clone())
+                    .collect();
+            } else if escape && self.viewer.is_none() {
+                // (Esc with the viewer open just closes the viewer.)
+                self.selection.clear();
+            }
+        }
+
         self.show_viewer(&ctx);
+        self.show_hover_zoom(&ctx);
     }
 }
