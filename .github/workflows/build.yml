@@ -23,7 +23,7 @@ jobs:
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Linux GUI build dependencies
         if: runner.os == 'Linux'
@@ -80,7 +80,7 @@ jobs:
 
           hdiutil create -volname Photo2Cull -srcfolder dmg-staging -ov -format UDZO Photo2Cull.dmg
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: photo2cull-${{ matrix.name }}
           path: |
