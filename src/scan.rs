@@ -37,6 +37,52 @@ pub fn disqualified_path_for(roots: &[PathBuf], photo: &Path) -> Option<PathBuf>
     Some(root.join(DISQUALIFIED_DIR).join(relative))
 }
 
+/// Extensions of "sidecar" files that travel with a photo: develop settings
+/// or metadata written by external editors, e.g. Lightroom/Capture One/
+/// darktable (`.xmp`), DxO PhotoLab (`.dop`), ON1 PhotoRAW (`.on1`) and
+/// RawTherapee (`.pp3`).
+const SIDECAR_EXTENSIONS: &[&str] = &["xmp", "dop", "on1", "pp3"];
+
+/// Sidecar files sitting next to `photo` in the same folder, so they can be
+/// moved alongside it. Matches both naming conventions in use: sidecar
+/// stripped down to just the photo's stem (`IMG_0001.xmp`, Lightroom/Capture
+/// One/darktable-style) and sidecar appended to the photo's full filename
+/// (`IMG_0001.CR2.dop`, DxO/ON1-style).
+pub fn sidecar_files_for(photo: &Path) -> Vec<PathBuf> {
+    let Some(dir) = photo.parent() else {
+        return Vec::new();
+    };
+    let Some(photo_name) = photo.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let Some(photo_stem) = photo.file_stem().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    read_dir
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p != photo)
+        .filter(|p| {
+            let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
+                return false;
+            };
+            if !SIDECAR_EXTENSIONS
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(ext))
+            {
+                return false;
+            }
+            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+                return false;
+            };
+            stem.eq_ignore_ascii_case(photo_name) || stem.eq_ignore_ascii_case(photo_stem)
+        })
+        .collect()
+}
+
 /// What sharpness-scoring mode to use for a photo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanMode {
@@ -224,5 +270,44 @@ mod tests {
             disqualified_path_for(&roots, Path::new("/a/inner/x.jpg")),
             Some(PathBuf::from("/a/inner").join(DISQUALIFIED_DIR).join("x.jpg"))
         );
+    }
+
+    #[test]
+    fn sidecar_files_matches_both_naming_conventions() {
+        let dir = std::env::temp_dir().join(format!(
+            "photo2cull-sidecar-test-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("IMG_0001.CR2");
+        for name in [
+            "IMG_0001.CR2",     // the photo itself, must be excluded
+            "IMG_0001.xmp",     // Lightroom/darktable/Capture One-style
+            "IMG_0001.CR2.dop", // DxO PhotoLab-style
+            "IMG_0001.CR2.on1", // ON1 PhotoRAW-style
+            "IMG_0001.CR2.pp3", // RawTherapee-style
+            "IMG_0001.jpg",     // unrelated derived file, not a sidecar
+            "IMG_0002.xmp",     // sidecar of a different photo
+        ] {
+            std::fs::write(dir.join(name), b"").unwrap();
+        }
+
+        let mut found: Vec<String> = sidecar_files_for(&photo)
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+
+        assert_eq!(
+            found,
+            vec![
+                "IMG_0001.CR2.dop",
+                "IMG_0001.CR2.on1",
+                "IMG_0001.CR2.pp3",
+                "IMG_0001.xmp",
+            ]
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

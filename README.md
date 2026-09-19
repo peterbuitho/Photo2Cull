@@ -25,6 +25,12 @@ Download a build from the [Releases](https://github.com/peterbuitho/Photo2Cull/r
 cargo run --release
 ```
 
+On macOS, `cargo run`/a bare `target/release/photo2cull` binary isn't an app bundle, so Finder opens it in Terminal. To get a double-clickable `Photo2Cull.app` locally (same packaging CI uses for releases), run:
+
+```
+packaging/macos/build-app.sh
+```
+
 Add one or more folders, click Scan, then sort/filter/group as needed.
 
 ## Hardware notes

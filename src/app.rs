@@ -10,7 +10,7 @@ use crate::dedupe::group_duplicates;
 use crate::metrics::{Metrics, Weights, overall_score};
 use crate::scan::{
     DISQUALIFIED_DIR, RecomputeEvent, ScanEvent, ScanMode, disqualified_path_for, run_recompute,
-    run_scan,
+    run_scan, sidecar_files_for,
 };
 use crate::sharpness::{PhotoMode, SharpnessMethod};
 
@@ -111,6 +111,13 @@ enum SortBy {
 /// to judge focus at full-window size.
 const PREVIEW_MAX_DIM: usize = 2400;
 
+/// How far the viewer can zoom in past "fit to window", as a multiplier.
+const MAX_VIEWER_ZOOM: f32 = 8.0;
+/// Scroll-to-zoom sensitivity: converts points of scroll into a zoom
+/// factor exponentially, so it composes smoothly across frames of a single
+/// scroll gesture (each frame's factor multiplies into the running zoom).
+const VIEWER_ZOOM_SPEED: f32 = 0.0025;
+
 /// Image cap for the hover-zoom lens: much sharper than the 220px thumbnail
 /// (which would just turn to mush when magnified), but cheaper to decode
 /// than the full-size viewer's `PREVIEW_MAX_DIM`.
@@ -134,6 +141,12 @@ struct Viewer {
     path: PathBuf,
     /// `None` while the full-size decode is still in flight.
     texture: Option<TextureHandle>,
+    /// Zoom multiplier on top of the fit-to-window scale; 1.0 = fit,
+    /// changed by scrolling or pinching over the image.
+    zoom: f32,
+    /// Image-center offset from the canvas center, in points, for panning
+    /// (by drag) once zoomed past fit.
+    pan: egui::Vec2,
 }
 
 enum PreviewEvent {
@@ -343,9 +356,11 @@ impl Photo2CullApp {
         });
     }
 
-    /// Move every currently-disqualified photo into a
-    /// `disqualified` subfolder of the scanned folder each one came from
-    /// (keeping its subfolder structure), in the background.
+    /// Move every currently-disqualified photo -- along with any sidecar
+    /// files next to it (Lightroom/darktable `.xmp`, DxO PhotoLab `.dop`,
+    /// ON1 PhotoRAW `.on1`, RawTherapee `.pp3`) -- into a `disqualified`
+    /// subfolder of the scanned folder each one came from (keeping its
+    /// subfolder structure), in the background.
     fn start_move_disqualified(&mut self) {
         if self.moving {
             return;
@@ -354,9 +369,13 @@ impl Photo2CullApp {
             .entries
             .iter()
             .filter(|e| self.is_disqualified(e))
-            .filter_map(|e| {
-                disqualified_path_for(&self.scanned_roots, &e.path)
-                    .map(|dest| (e.path.clone(), dest))
+            .flat_map(|e| {
+                let mut paths = vec![e.path.clone()];
+                paths.extend(sidecar_files_for(&e.path));
+                paths
+            })
+            .filter_map(|path| {
+                disqualified_path_for(&self.scanned_roots, &path).map(|dest| (path, dest))
             })
             .collect();
         if items.is_empty() {
@@ -431,6 +450,8 @@ impl Photo2CullApp {
         self.viewer = Some(Viewer {
             path: path.clone(),
             texture: None,
+            zoom: 1.0,
+            pan: egui::Vec2::ZERO,
         });
         let (tx, rx) = channel();
         self.preview_rx = Some(rx);
@@ -730,7 +751,7 @@ impl Photo2CullApp {
     }
 
     fn show_viewer(&mut self, ctx: &egui::Context) {
-        let Some(viewer) = &self.viewer else {
+        let Some(viewer) = &mut self.viewer else {
             return;
         };
         let name = viewer
@@ -749,18 +770,67 @@ impl Photo2CullApp {
             .frame(egui::Frame::popup(&ctx.style_of(ctx.theme())))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading(name);
+                    ui.heading(&name);
                     if ui.button("✕").clicked() {
                         close = true;
+                    }
+                    if viewer.zoom > 1.0 {
+                        ui.label(format!("{:.0}%", viewer.zoom * 100.0));
+                        if ui.button("Reset zoom").clicked() {
+                            viewer.zoom = 1.0;
+                            viewer.pan = egui::Vec2::ZERO;
+                        }
                     }
                 });
                 ui.separator();
                 match &viewer.texture {
                     Some(tex) => {
                         let avail = ctx.content_rect().size() * 0.85;
+                        let (canvas_rect, response) =
+                            ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+
                         let size = tex.size_vec2();
-                        let scale = (avail.x / size.x).min(avail.y / size.y).min(1.0);
-                        ui.image((tex.id(), size * scale));
+                        let fit_scale = (avail.x / size.x).min(avail.y / size.y).min(1.0);
+
+                        // Scroll to zoom, anchored on the cursor so the
+                        // point under it stays put as the image scales.
+                        if let Some(hover_pos) = response.hover_pos() {
+                            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                            let pinch = ui.input(|i| i.zoom_delta());
+                            let factor = (-scroll * VIEWER_ZOOM_SPEED).exp() * pinch;
+                            if factor != 1.0 {
+                                let old_scale = fit_scale * viewer.zoom;
+                                viewer.zoom = (viewer.zoom * factor).clamp(1.0, MAX_VIEWER_ZOOM);
+                                let new_scale = fit_scale * viewer.zoom;
+                                let cursor = hover_pos - canvas_rect.center();
+                                viewer.pan =
+                                    cursor - (cursor - viewer.pan) * (new_scale / old_scale);
+                            }
+                        }
+                        if response.dragged() {
+                            viewer.pan += response.drag_delta();
+                        }
+
+                        let scale = fit_scale * viewer.zoom;
+                        let draw_size = size * scale;
+                        let max_pan =
+                            ((draw_size - canvas_rect.size()) * 0.5).max(egui::Vec2::ZERO);
+                        viewer.pan.x = viewer.pan.x.clamp(-max_pan.x, max_pan.x);
+                        viewer.pan.y = viewer.pan.y.clamp(-max_pan.y, max_pan.y);
+
+                        let image_rect = egui::Rect::from_center_size(
+                            canvas_rect.center() + viewer.pan,
+                            draw_size,
+                        );
+                        ui.painter_at(canvas_rect).image(
+                            tex.id(),
+                            image_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                        if viewer.zoom > 1.0 {
+                            let _ = response.on_hover_cursor(egui::CursorIcon::Grab);
+                        }
                     }
                     None => {
                         ui.horizontal(|ui| {
