@@ -9,7 +9,7 @@
 # Builds the release binary if needed, then stages ./Photo2Cull.app in the
 # repo root (gitignored). Run it again after pulling changes to refresh it.
 
-set -eu
+set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 

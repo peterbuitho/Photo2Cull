@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
@@ -43,6 +46,9 @@ jobs:
 
       - name: Check
         run: cargo check --target ${{ matrix.target }}
+
+      - name: Clippy
+        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
 
       - name: Test
         run: cargo test --target ${{ matrix.target }}

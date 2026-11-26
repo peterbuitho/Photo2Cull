@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,8 +11,8 @@ use egui::{ColorImage, TextureHandle, TextureOptions};
 use crate::dedupe::group_duplicates;
 use crate::metrics::{Metrics, Weights, overall_score};
 use crate::scan::{
-    DISQUALIFIED_DIR, RecomputeEvent, ScanEvent, ScanMode, disqualified_path_for, run_recompute,
-    run_scan, sidecar_files_for,
+    DISQUALIFIED_DIR, RecomputeEvent, ScanEvent, ScanMode, plan_disqualified_moves,
+    run_recompute, run_scan,
 };
 use crate::sharpness::{PhotoMode, SharpnessMethod};
 
@@ -90,9 +92,10 @@ struct PipelineResult {
     total: usize,
     after_technical: usize,
     after_dedupe: usize,
-    /// Entry indices, ranked by Overall score (best first), truncated to
-    /// the requested shortlist size.
-    shortlist: Vec<usize>,
+    /// Entry paths, ranked by Overall score (best first), truncated to
+    /// the requested shortlist size. Stored as paths rather than indices so
+    /// moving disqualified photos never invalidates them.
+    shortlist: Vec<PathBuf>,
 }
 
 /// Which score the grid is sorted (and, for `Overall`, flagged) by. The
@@ -124,6 +127,9 @@ const VIEWER_ZOOM_SPEED: f32 = 0.0025;
 const HOVER_ZOOM_MAX_DIM: usize = 1200;
 /// Decoded hover-zoom textures kept around so re-hovering a photo is instant.
 const HOVER_ZOOM_CACHE: usize = 8;
+/// Cap on concurrent hover-zoom background decodes so rapid sweeping across
+/// thumbnails does not spawn unbounded OS threads.
+const MAX_HOVER_ZOOM_LOADS: usize = 2;
 /// Vertices around the lens rim; enough that the circle looks smooth.
 const LENS_SEGMENTS: usize = 64;
 
@@ -162,7 +168,7 @@ enum PreviewEvent {
 }
 
 enum MoveEvent {
-    Moved(PathBuf),
+    Moved { path: PathBuf, is_sidecar: bool },
     Failed(PathBuf, String),
     Done,
 }
@@ -184,7 +190,9 @@ pub struct Photo2CullApp {
     errors: Vec<(PathBuf, String)>,
     total_found: usize,
     processed: usize,
+    scanned_ok: usize,
     scanning: bool,
+    scan_cancel: Arc<AtomicBool>,
     rx: Option<Receiver<ScanEvent>>,
     recompute_rx: Option<Receiver<RecomputeEvent>>,
     recomputing: bool,
@@ -212,16 +220,23 @@ pub struct Photo2CullApp {
     hover_zoom_seen: bool,
     zoom_cache: Vec<(PathBuf, TextureHandle)>,
     zoom_loading: HashSet<PathBuf>,
+    zoom_failed: HashSet<PathBuf>,
     zoom_tx: Sender<PreviewEvent>,
     zoom_rx: Receiver<PreviewEvent>,
     preview_rx: Option<Receiver<PreviewEvent>>,
     moving: bool,
     move_rx: Option<Receiver<MoveEvent>>,
     move_moved: usize,
+    move_sidecars_moved: usize,
     move_failed: usize,
+    move_errors: Vec<(PathBuf, String)>,
     move_status: Option<String>,
     weights: Weights,
     sort_by: SortBy,
+    flat_order: Vec<usize>,
+    flat_order_dirty: bool,
+    flat_order_sort_by: SortBy,
+    flat_order_weights: Weights,
     view_mode: ViewMode,
     /// Duplicate/burst clusters (2+ members each) from the last "Group
     /// duplicates" click; empty until then. Stored as paths rather than
@@ -239,6 +254,8 @@ pub struct Photo2CullApp {
 impl Photo2CullApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         let (zoom_tx, zoom_rx) = channel();
+        let weights = Weights::default();
+        let sort_by = SortBy::Sharpness;
         Self {
             roots: Vec::new(),
             scanned_roots: Vec::new(),
@@ -249,7 +266,9 @@ impl Photo2CullApp {
             errors: Vec::new(),
             total_found: 0,
             processed: 0,
+            scanned_ok: 0,
             scanning: false,
+            scan_cancel: Arc::new(AtomicBool::new(false)),
             rx: None,
             recompute_rx: None,
             recomputing: false,
@@ -266,16 +285,23 @@ impl Photo2CullApp {
             hover_zoom_seen: false,
             zoom_cache: Vec::new(),
             zoom_loading: HashSet::new(),
+            zoom_failed: HashSet::new(),
             zoom_tx,
             zoom_rx,
             preview_rx: None,
             moving: false,
             move_rx: None,
             move_moved: 0,
+            move_sidecars_moved: 0,
             move_failed: 0,
+            move_errors: Vec::new(),
             move_status: None,
-            weights: Weights::default(),
-            sort_by: SortBy::Sharpness,
+            weights,
+            sort_by,
+            flat_order: Vec::new(),
+            flat_order_dirty: true,
+            flat_order_sort_by: sort_by,
+            flat_order_weights: weights,
             view_mode: ViewMode::Flat,
             groups: Vec::new(),
             group_threshold: 6,
@@ -329,8 +355,7 @@ impl Photo2CullApp {
                 .filter_map(|p| path_to_idx.get(p).copied())
                 .max_by(|&a, &b| {
                     overall_score(&self.entries[a].metrics, &self.weights)
-                        .partial_cmp(&overall_score(&self.entries[b].metrics, &self.weights))
-                        .unwrap()
+                        .total_cmp(&overall_score(&self.entries[b].metrics, &self.weights))
                 });
             keepers.extend(best);
         }
@@ -343,54 +368,54 @@ impl Photo2CullApp {
 
         keepers.sort_by(|&a, &b| {
             overall_score(&self.entries[b].metrics, &self.weights)
-                .partial_cmp(&overall_score(&self.entries[a].metrics, &self.weights))
-                .unwrap()
+                .total_cmp(&overall_score(&self.entries[a].metrics, &self.weights))
         });
         keepers.truncate(self.pipeline_top_n);
+        let shortlist: Vec<PathBuf> = keepers
+            .into_iter()
+            .map(|i| self.entries[i].path.clone())
+            .collect();
 
         self.pipeline_result = Some(PipelineResult {
             total,
             after_technical,
             after_dedupe,
-            shortlist: keepers,
+            shortlist,
         });
     }
 
-    /// Move every currently-disqualified photo -- along with any sidecar
-    /// files next to it (Lightroom/darktable `.xmp`, DxO PhotoLab `.dop`,
-    /// ON1 PhotoRAW `.on1`, RawTherapee `.pp3`) -- into a `disqualified`
-    /// subfolder of the scanned folder each one came from (keeping its
-    /// subfolder structure), in the background.
+    /// Move every currently-disqualified photo -- along with any eligible
+    /// sidecar files next to it (Lightroom/darktable `.xmp`, DxO PhotoLab
+    /// `.dop`, ON1 PhotoRAW `.on1`, RawTherapee `.pp3`) -- into a
+    /// `disqualified` subfolder of the scanned folder each one came from
+    /// (keeping its subfolder structure), in the background.
     fn start_move_disqualified(&mut self) {
         if self.moving {
             return;
         }
-        let items: Vec<(PathBuf, PathBuf)> = self
+        let disqualified: Vec<PathBuf> = self
             .entries
             .iter()
             .filter(|e| self.is_disqualified(e))
-            .flat_map(|e| {
-                let mut paths = vec![e.path.clone()];
-                paths.extend(sidecar_files_for(&e.path));
-                paths
-            })
-            .filter_map(|path| {
-                disqualified_path_for(&self.scanned_roots, &path).map(|dest| (path, dest))
-            })
+            .map(|e| e.path.clone())
             .collect();
-        if items.is_empty() {
+        if disqualified.is_empty() {
             return;
         }
 
+        let roots = self.scanned_roots.clone();
         self.moving = true;
         self.move_moved = 0;
+        self.move_sidecars_moved = 0;
         self.move_failed = 0;
+        self.move_errors.clear();
         self.move_status = None;
         let (tx, rx) = channel();
         self.move_rx = Some(rx);
         thread::spawn(move || {
-            for (path, dest) in items {
-                let result = match dest.parent() {
+            let items = plan_disqualified_moves(&roots, &disqualified);
+            for item in items {
+                let result = match item.dest.parent() {
                     Some(dir) => std::fs::create_dir_all(dir)
                         .map_err(|e| {
                             std::io::Error::other(format!(
@@ -398,12 +423,24 @@ impl Photo2CullApp {
                                 dir.display()
                             ))
                         })
-                        .and_then(|()| std::fs::rename(&path, &dest)),
+                        .and_then(|()| {
+                            if item.dest.symlink_metadata().is_ok() {
+                                Err(std::io::Error::new(
+                                    std::io::ErrorKind::AlreadyExists,
+                                    format!("destination already exists: {}", item.dest.display()),
+                                ))
+                            } else {
+                                std::fs::rename(&item.src, &item.dest)
+                            }
+                        }),
                     None => Err(std::io::Error::other("photo path has no parent folder")),
                 };
                 let _ = tx.send(match result {
-                    Ok(()) => MoveEvent::Moved(path),
-                    Err(e) => MoveEvent::Failed(path, e.to_string()),
+                    Ok(()) => MoveEvent::Moved {
+                        path: item.src,
+                        is_sidecar: item.is_sidecar,
+                    },
+                    Err(e) => MoveEvent::Failed(item.src, e.to_string()),
                 });
             }
             let _ = tx.send(MoveEvent::Done);
@@ -417,15 +454,23 @@ impl Photo2CullApp {
         let mut done = false;
         while let Ok(event) = rx.try_recv() {
             match event {
-                MoveEvent::Moved(path) => {
-                    self.entries.retain(|e| e.path != path);
-                    self.selection.remove(&path);
-                    // Entry indices shifted; a stale order would mis-select.
-                    self.visible_order.clear();
-                    self.move_moved += 1;
+                MoveEvent::Moved { path, is_sidecar } => {
+                    if is_sidecar {
+                        self.move_sidecars_moved += 1;
+                    } else {
+                        self.entries.retain(|e| e.path != path);
+                        self.selection.remove(&path);
+                        // Entry indices shifted; a stale order would mis-select.
+                        self.visible_order.clear();
+                        self.flat_order_dirty = true;
+                        if self.viewer.as_ref().is_some_and(|v| v.path == path) {
+                            self.viewer = None;
+                        }
+                        self.move_moved += 1;
+                    }
                 }
                 MoveEvent::Failed(path, err) => {
-                    self.errors.push((path, err));
+                    self.move_errors.push((path, err));
                     self.move_failed += 1;
                 }
                 MoveEvent::Done => done = true,
@@ -434,13 +479,22 @@ impl Photo2CullApp {
         if done {
             self.moving = false;
             self.move_rx = None;
+            let sidecar_note = if self.move_sidecars_moved > 0 {
+                format!(
+                    " (+{} sidecar{})",
+                    self.move_sidecars_moved,
+                    if self.move_sidecars_moved == 1 { "" } else { "s" }
+                )
+            } else {
+                String::new()
+            };
             self.move_status = Some(if self.move_failed > 0 {
                 format!(
-                    "Moved {} to {DISQUALIFIED_DIR}/, {} failed",
+                    "Moved {}{sidecar_note} to {DISQUALIFIED_DIR}/, {} failed",
                     self.move_moved, self.move_failed
                 )
             } else {
-                format!("Moved {} to {DISQUALIFIED_DIR}/", self.move_moved)
+                format!("Moved {}{sidecar_note} to {DISQUALIFIED_DIR}/", self.move_moved)
             });
         }
     }
@@ -512,24 +566,35 @@ impl Photo2CullApp {
         self.scanned_roots = roots.clone();
         self.hover_zoom = None;
         self.zoom_cache.clear();
+        self.zoom_loading.clear();
+        self.zoom_failed.clear();
+        self.viewer = None;
+        self.preview_rx = None;
         self.selection.clear();
         self.selection_anchor = None;
         self.visible_order.clear();
+        self.flat_order.clear();
+        self.flat_order_dirty = true;
         self.entries.clear();
         self.errors.clear();
+        self.move_errors.clear();
+        self.move_status = None;
         self.total_found = 0;
         self.processed = 0;
+        self.scanned_ok = 0;
         self.scanning = true;
         self.groups.clear();
         self.pipeline_result = None;
         self.view_mode = ViewMode::Flat;
 
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.scan_cancel = cancel.clone();
         let (tx, rx) = channel();
         self.rx = Some(rx);
         let scan_mode = self.scan_mode;
         let method = self.sharpness_method;
         self.scanned_method = method;
-        thread::spawn(move || run_scan(roots, scan_mode, method, tx));
+        thread::spawn(move || run_scan(roots, scan_mode, method, cancel, tx));
     }
 
     /// Re-score every entry whose type was manually changed since its last
@@ -562,6 +627,8 @@ impl Photo2CullApp {
                     ScanEvent::Found(n) => self.total_found = n,
                     ScanEvent::Photo(p) => {
                         self.processed += 1;
+                        self.scanned_ok += 1;
+                        self.flat_order_dirty = true;
                         let image = ColorImage::from_rgb(
                             [p.thumb_w as usize, p.thumb_h as usize],
                             &p.thumb_rgb,
@@ -604,6 +671,7 @@ impl Photo2CullApp {
                             entry.score = r.score;
                             entry.metrics = r.metrics;
                             entry.dirty = false;
+                            self.flat_order_dirty = true;
                         }
                     }
                     RecomputeEvent::Done => done = true,
@@ -619,7 +687,10 @@ impl Photo2CullApp {
     /// Decode `path` at hover-zoom size in the background; the result comes
     /// back over `zoom_rx` and is cached by `drain_zoom`.
     fn start_zoom_load(&mut self, path: PathBuf) {
-        if !self.zoom_loading.insert(path.clone()) {
+        if self.zoom_failed.contains(&path)
+            || self.zoom_loading.len() >= MAX_HOVER_ZOOM_LOADS
+            || !self.zoom_loading.insert(path.clone())
+        {
             return;
         }
         let tx = self.zoom_tx.clone();
@@ -653,9 +724,10 @@ impl Photo2CullApp {
                     }
                     self.zoom_cache.push((path, texture));
                 }
-                // Left in `zoom_loading` so a photo that fails to decode
-                // isn't retried on every frame of the hover.
-                PreviewEvent::Failed { .. } => {}
+                PreviewEvent::Failed { path } => {
+                    self.zoom_loading.remove(&path);
+                    self.zoom_failed.insert(path);
+                }
             }
         }
     }
@@ -786,10 +858,13 @@ impl Photo2CullApp {
                 match &viewer.texture {
                     Some(tex) => {
                         let avail = ctx.content_rect().size() * 0.85;
+                        let size = tex.size_vec2();
+                        if avail.x <= 0.0 || avail.y <= 0.0 || size.x <= 0.0 || size.y <= 0.0 {
+                            return;
+                        }
                         let (canvas_rect, response) =
                             ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
 
-                        let size = tex.size_vec2();
                         let fit_scale = (avail.x / size.x).min(avail.y / size.y).min(1.0);
 
                         // Scroll to zoom, anchored on the cursor so the
@@ -798,8 +873,8 @@ impl Photo2CullApp {
                             let scroll = ui.input(|i| i.smooth_scroll_delta.y);
                             let pinch = ui.input(|i| i.zoom_delta());
                             let factor = (-scroll * VIEWER_ZOOM_SPEED).exp() * pinch;
-                            if factor != 1.0 {
-                                let old_scale = fit_scale * viewer.zoom;
+                            let old_scale = fit_scale * viewer.zoom;
+                            if factor != 1.0 && old_scale > 0.0 {
                                 viewer.zoom = (viewer.zoom * factor).clamp(1.0, MAX_VIEWER_ZOOM);
                                 let new_scale = fit_scale * viewer.zoom;
                                 let cursor = hover_pos - canvas_rect.center();
@@ -1006,7 +1081,7 @@ impl Photo2CullApp {
                     }
 
                     let mut mode = self.entries[idx].mode;
-                    egui::ComboBox::from_id_salt(("photo-mode", idx))
+                    egui::ComboBox::from_id_salt(("photo-mode", &self.entries[idx].path))
                         .selected_text(mode.label())
                         .width(88.0)
                         .show_ui(ui, |ui| {
@@ -1122,7 +1197,7 @@ impl Photo2CullApp {
             .enumerate()
             .map(|(i, e)| (e.path.clone(), i))
             .collect();
-        let groups = self.groups.clone();
+        let groups = std::mem::take(&mut self.groups);
         let weights = self.weights;
 
         egui::ScrollArea::vertical()
@@ -1139,8 +1214,7 @@ impl Photo2CullApp {
 
                     let best_idx = indices.iter().copied().max_by(|&a, &b| {
                         overall_score(&self.entries[a].metrics, &weights)
-                            .partial_cmp(&overall_score(&self.entries[b].metrics, &weights))
-                            .unwrap()
+                            .total_cmp(&overall_score(&self.entries[b].metrics, &weights))
                     });
 
                     ui.label(format!("Group {} ({} photos)", gi + 1, indices.len()));
@@ -1148,6 +1222,7 @@ impl Photo2CullApp {
                     ui.separator();
                 }
             });
+        self.groups = groups;
     }
 
     /// The pipeline shortlist view: the funnel summary line, then the
@@ -1157,20 +1232,58 @@ impl Photo2CullApp {
             ui.label("Click \"Rank now\" to filter, dedupe, and rank down to a shortlist.");
             return;
         };
+        let path_to_idx: HashMap<&Path, usize> = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.path.as_path(), i))
+            .collect();
+        let indices: Vec<usize> = result
+            .shortlist
+            .iter()
+            .filter_map(|p| path_to_idx.get(p.as_path()).copied())
+            .collect();
         let summary = format!(
             "{} photos → {} after removing disqualified → {} after dedupe → top {} shown",
             result.total,
             result.after_technical,
             result.after_dedupe,
-            result.shortlist.len()
+            indices.len()
         );
-        let shortlist = result.shortlist.clone();
 
         ui.label(summary);
         egui::ScrollArea::vertical()
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                self.photo_row_grid(ui, &shortlist, None, open_request);
+                self.photo_row_grid(ui, &indices, None, open_request);
+            });
+    }
+
+    fn render_error_list(
+        ui: &mut egui::Ui,
+        id: &str,
+        heading: String,
+        errors: &[(PathBuf, String)],
+    ) {
+        if errors.is_empty() {
+            return;
+        }
+        egui::CollapsingHeader::new(heading)
+            .id_salt(id)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt((id, "scroll"))
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        for (path, err) in errors {
+                            let name = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| path.display().to_string());
+                            ui.small(format!("{name}: {err}"))
+                                .on_hover_text(path.display().to_string());
+                        }
+                    });
             });
     }
 }
@@ -1239,7 +1352,10 @@ impl eframe::App for Photo2CullApp {
 
                 ui.separator();
 
-                let can_scan = !self.roots.is_empty() && !self.scanning;
+                let can_scan = !self.roots.is_empty()
+                    && !self.scanning
+                    && !self.moving
+                    && !self.recomputing;
                 let scan_label = if can_scan {
                     egui::RichText::new("Scan")
                         .strong()
@@ -1259,8 +1375,19 @@ impl eframe::App for Photo2CullApp {
                 if self.scanning {
                     ui.spinner();
                     ui.label(format!("{} / {}", self.processed, self.total_found));
+                    if ui.button("Cancel").clicked() {
+                        self.scan_cancel.store(true, Ordering::Relaxed);
+                    }
                 } else if self.total_found > 0 {
-                    ui.label(format!("{} photos scanned", self.total_found));
+                    if self.errors.is_empty() {
+                        ui.label(format!("{} photos scanned", self.scanned_ok));
+                    } else {
+                        ui.label(format!(
+                            "{} scanned ({} failed)",
+                            self.scanned_ok,
+                            self.errors.len()
+                        ));
+                    }
                 }
 
                 ui.separator();
@@ -1311,9 +1438,21 @@ impl eframe::App for Photo2CullApp {
                 ui.label(
                     "Add one or more folders and click Scan to check focus sharpness across your photos (RAW, PNG, JPG, TIFF, BMP, WebP).",
                 );
-                if !self.errors.is_empty() {
-                    ui.label(format!("{} files failed to decode", self.errors.len()));
+                if let Some(status) = &self.move_status {
+                    ui.label(status);
                 }
+                Self::render_error_list(
+                    ui,
+                    "empty-decode-errors",
+                    format!("{} files failed to decode", self.errors.len()),
+                    &self.errors,
+                );
+                Self::render_error_list(
+                    ui,
+                    "empty-move-errors",
+                    format!("{} files failed to move", self.move_errors.len()),
+                    &self.move_errors,
+                );
                 return;
             }
 
@@ -1347,7 +1486,7 @@ impl eframe::App for Photo2CullApp {
                         ui.separator();
 
                         ui.horizontal(|ui| {
-                            ui.label("Disqualify scores below");
+                            ui.label("Disqualify scores ≤");
                             ui.add(
                                 egui::DragValue::new(&mut self.cull_threshold)
                                     .speed(1.0)
@@ -1659,41 +1798,62 @@ impl eframe::App for Photo2CullApp {
                 });
             });
 
-            if !self.errors.is_empty() {
-                ui.label(format!("{} files failed to decode", self.errors.len()));
-            }
+            Self::render_error_list(
+                ui,
+                "decode-errors",
+                format!("{} files failed to decode", self.errors.len()),
+                &self.errors,
+            );
+            Self::render_error_list(
+                ui,
+                "move-errors",
+                format!("{} files failed to move", self.move_errors.len()),
+                &self.move_errors,
+            );
             ui.separator();
 
             let mut open_request: Option<PathBuf> = None;
 
             match self.view_mode {
                 ViewMode::Flat => {
-                    let mut order: Vec<usize> = (0..self.entries.len()).collect();
-                    match self.sort_by {
-                        SortBy::Sharpness => order.sort_by(|&a, &b| {
-                            self.entries[a]
-                                .score
-                                .partial_cmp(&self.entries[b].score)
-                                .unwrap()
-                        }),
-                        SortBy::Overall => order.sort_by(|&a, &b| {
-                            let oa = overall_score(&self.entries[a].metrics, &self.weights);
-                            let ob = overall_score(&self.entries[b].metrics, &self.weights);
-                            // Higher Overall first -- unlike Sharpness, where
-                            // worst-first matches "what should I cull", Overall
-                            // is "what's best".
-                            ob.partial_cmp(&oa).unwrap()
-                        }),
+                    if self.flat_order_dirty
+                        || self.flat_order_sort_by != self.sort_by
+                        || self.flat_order_weights != self.weights
+                        || self.flat_order.len() != self.entries.len()
+                    {
+                        self.flat_order = (0..self.entries.len()).collect();
+                        match self.sort_by {
+                            SortBy::Sharpness => self.flat_order.sort_by(|&a, &b| {
+                                self.entries[a].score.total_cmp(&self.entries[b].score)
+                            }),
+                            SortBy::Overall => {
+                                let weights = self.weights;
+                                let entries = &self.entries;
+                                self.flat_order.sort_by(|&a, &b| {
+                                    let oa = overall_score(&entries[a].metrics, &weights);
+                                    let ob = overall_score(&entries[b].metrics, &weights);
+                                    // Higher Overall first -- unlike Sharpness, where
+                                    // worst-first matches "what should I cull", Overall
+                                    // is "what's best".
+                                    ob.total_cmp(&oa)
+                                });
+                            }
+                        }
+                        self.flat_order_dirty = false;
+                        self.flat_order_sort_by = self.sort_by;
+                        self.flat_order_weights = self.weights;
                     }
 
                     // `auto_shrink` defaults to [true, true], meaning the area
                     // shrinks its *width* to fit its content -- pin it to the
                     // panel's, leaving only the vertical axis auto-sized.
+                    let order = std::mem::take(&mut self.flat_order);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
                             self.photo_row_grid(ui, &order, None, &mut open_request);
                         });
+                    self.flat_order = order;
                 }
                 ViewMode::Grouped => {
                     self.render_groups(ui, &mut open_request);

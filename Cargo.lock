@@ -3665,7 +3665,6 @@ dependencies = [
  "rawler",
  "rayon",
  "rfd",
- "serde",
  "tract",
  "walkdir",
 ]

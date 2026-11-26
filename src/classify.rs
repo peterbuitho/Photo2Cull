@@ -106,7 +106,7 @@ fn iou(a: [f32; 4], b: [f32; 4]) -> f32 {
 }
 
 pub(crate) fn nms(mut candidates: Vec<(f32, [f32; 4])>) -> Vec<(f32, [f32; 4])> {
-    candidates.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut kept: Vec<(f32, [f32; 4])> = Vec::new();
     for (score, b) in candidates {
         if kept.iter().all(|&(_, k)| iou(k, b) <= IOU_THRESHOLD) {
@@ -157,7 +157,7 @@ pub fn detect_faces(rgb: &RgbImage) -> Vec<FaceBox> {
     let mut candidates: Vec<(f32, [f32; 4])> = Vec::new();
     for i in 0..n {
         let face_score = confidences[i * 2 + 1];
-        if face_score <= CONF_THRESHOLD {
+        if face_score.is_nan() || face_score <= CONF_THRESHOLD {
             continue;
         }
         let [pcx, pcy, pw, ph] = priors[i];
@@ -170,6 +170,9 @@ pub fn detect_faces(rgb: &RgbImage) -> Vec<FaceBox> {
         let cy = ly * CENTER_VARIANCE * ph + pcy;
         let w = (lw * SIZE_VARIANCE).exp() * pw;
         let h = (lh * SIZE_VARIANCE).exp() * ph;
+        if !(cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite()) {
+            continue;
+        }
 
         candidates.push((
             face_score,
@@ -202,7 +205,7 @@ pub fn detect_main_face(rgb: &RgbImage) -> Option<FaceBox> {
     detect_faces(rgb).into_iter().max_by(|a, b| {
         let area_a = (a.x2 - a.x1) * (a.y2 - a.y1);
         let area_b = (b.x2 - b.x1) * (b.y2 - b.y1);
-        area_a.partial_cmp(&area_b).unwrap()
+        area_a.total_cmp(&area_b)
     })
 }
 
@@ -217,5 +220,21 @@ mod tests {
     #[test]
     fn prior_count_matches_model_output() {
         assert_eq!(generate_priors().len(), 4420);
+    }
+
+    #[test]
+    fn nms_handles_nan_scores_without_panicking() {
+        let kept = nms(vec![
+            (f32::NAN, [0.0, 0.0, 0.5, 0.5]),
+            (0.9, [0.1, 0.1, 0.6, 0.6]),
+        ]);
+        assert!(!kept.is_empty());
+    }
+
+    #[test]
+    fn bundled_face_model_loads_and_runs() {
+        let img = RgbImage::from_pixel(64, 64, image::Rgb([128, 128, 128]));
+        let faces = detect_faces(&img);
+        assert!(faces.is_empty());
     }
 }

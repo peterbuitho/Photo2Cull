@@ -109,13 +109,16 @@ pub fn detect_animals(rgb: &RgbImage) -> Vec<FaceBox> {
             .map(|c| row[5 + c])
             .fold(0.0_f32, f32::max);
         let score = objectness * best_class;
-        if score < CONF_THRESHOLD {
+        if score.is_nan() || score < CONF_THRESHOLD {
             continue;
         }
         let cx = (row[0] + gx) * stride;
         let cy = (row[1] + gy) * stride;
         let w = row[2].exp() * stride;
         let h = row[3].exp() * stride;
+        if !(cx.is_finite() && cy.is_finite() && w.is_finite() && h.is_finite()) {
+            continue;
+        }
         candidates.push((score, [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0]));
     }
 
@@ -141,7 +144,7 @@ pub fn detect_main_animal(rgb: &RgbImage) -> Option<FaceBox> {
     detect_animals(rgb).into_iter().max_by(|a, b| {
         let area_a = (a.x2 - a.x1) * (a.y2 - a.y1);
         let area_b = (b.x2 - b.x1) * (b.y2 - b.y1);
-        area_a.partial_cmp(&area_b).unwrap()
+        area_a.total_cmp(&area_b)
     })
 }
 
@@ -153,5 +156,12 @@ mod tests {
     #[test]
     fn grid_count_matches_model_output() {
         assert_eq!(grid().len(), 3549);
+    }
+
+    #[test]
+    fn bundled_animal_model_loads_and_runs() {
+        let img = RgbImage::from_pixel(64, 64, image::Rgb([128, 128, 128]));
+        let detections = detect_animals(&img);
+        assert!(detections.is_empty());
     }
 }

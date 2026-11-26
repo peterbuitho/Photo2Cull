@@ -105,6 +105,9 @@ fn center_crop(img: &GrayImage, fraction: f32) -> GrayImage {
 /// the image bounds.
 fn face_crop(img: &GrayImage, face: &FaceBox) -> GrayImage {
     let (iw, ih) = img.dimensions();
+    if iw == 0 || ih == 0 {
+        return GrayImage::new(0, 0);
+    }
     let cx = (face.x1 + face.x2) / 2.0;
     let cy = (face.y1 + face.y2) / 2.0;
     let w = ((face.x2 - face.x1) * 1.7).max(1.0);
@@ -133,21 +136,25 @@ fn variance(values: impl Iterator<Item = i16> + Clone) -> f64 {
 }
 
 fn variance_of_laplacian(region: &GrayImage) -> f64 {
+    if region.width() == 0 || region.height() == 0 {
+        return 0.0;
+    }
     let lap: image::ImageBuffer<Luma<i16>, Vec<i16>> = laplacian_filter(region);
     variance(lap.as_raw().iter().copied())
 }
 
-/// Mean Laplacian variance of the sharpest [`TOP_TILE_FRACTION`] of tiles.
-/// The Laplacian is computed once over the whole frame, then variance is
-/// taken per tile.
-fn sharpest_region_score(gray: &GrayImage) -> f64 {
-    let (w, h) = gray.dimensions();
+/// Mean Laplacian variance of the sharpest [`TOP_TILE_FRACTION`] of tiles,
+/// computed from an existing full-frame Laplacian buffer.
+fn sharpest_region_score_from_lap(lap: &image::ImageBuffer<Luma<i16>, Vec<i16>>) -> f64 {
+    let (w, h) = lap.dimensions();
+    if w == 0 || h == 0 {
+        return 0.0;
+    }
+    let raw = lap.as_raw();
     let tile = (w.max(h) / TILE_GRID).max(8);
     if w < tile || h < tile {
-        return variance_of_laplacian(gray);
+        return variance(raw.iter().copied());
     }
-    let lap: image::ImageBuffer<Luma<i16>, Vec<i16>> = laplacian_filter(gray);
-    let raw = lap.as_raw();
 
     let mut tile_scores: Vec<f64> = Vec::new();
     for ty in (0..h).step_by(tile as usize) {
@@ -165,11 +172,52 @@ fn sharpest_region_score(gray: &GrayImage) -> f64 {
         }
     }
     if tile_scores.is_empty() {
-        return variance_of_laplacian(gray);
+        return variance(raw.iter().copied());
     }
-    tile_scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    tile_scores.sort_by(|a, b| b.total_cmp(a));
     let k = ((tile_scores.len() as f64 * TOP_TILE_FRACTION).ceil() as usize).max(1);
     tile_scores[..k].iter().sum::<f64>() / k as f64
+}
+
+/// Mean Laplacian variance of the sharpest [`TOP_TILE_FRACTION`] of tiles.
+/// The Laplacian is computed once over the whole frame, then variance is
+/// taken per tile.
+fn sharpest_region_score(gray: &GrayImage) -> f64 {
+    if gray.width() == 0 || gray.height() == 0 {
+        return 0.0;
+    }
+    let lap: image::ImageBuffer<Luma<i16>, Vec<i16>> = laplacian_filter(gray);
+    sharpest_region_score_from_lap(&lap)
+}
+
+/// Variance-of-Laplacian sharpness score using a precomputed `GrayImage`
+/// (and optional full-frame Laplacian buffer to avoid recomputing it).
+pub(crate) fn score_gray(
+    gray: &GrayImage,
+    full_lap: Option<&image::ImageBuffer<Luma<i16>, Vec<i16>>>,
+    mode: PhotoMode,
+    subject: Option<&FaceBox>,
+    method: SharpnessMethod,
+) -> f64 {
+    if let Some(b) = subject {
+        return variance_of_laplacian(&face_crop(gray, b));
+    }
+    match method {
+        SharpnessMethod::FixedRegion => match (mode, full_lap) {
+            (PhotoMode::Landscape, Some(lap)) => {
+                if lap.width() == 0 || lap.height() == 0 {
+                    0.0
+                } else {
+                    variance(lap.as_raw().iter().copied())
+                }
+            }
+            _ => variance_of_laplacian(&center_crop(gray, mode.region_fraction())),
+        },
+        SharpnessMethod::SharpestRegion => match full_lap {
+            Some(lap) => sharpest_region_score_from_lap(lap),
+            None => sharpest_region_score(gray),
+        },
+    }
 }
 
 /// Variance-of-Laplacian sharpness score. Higher means sharper. If `subject`
@@ -182,15 +230,28 @@ pub fn score(
     subject: Option<&FaceBox>,
     method: SharpnessMethod,
 ) -> f64 {
-    let gray: GrayImage = image::DynamicImage::ImageRgb8(rgb.clone()).to_luma8();
-    if let Some(b) = subject {
-        return variance_of_laplacian(&face_crop(&gray, b));
+    let gray = image::imageops::grayscale(rgb);
+    score_gray(&gray, None, mode, subject, method)
+}
+
+/// Variant of [`guess_landscape_or_object`] reusing a precomputed grayscale
+/// image and full-frame Laplacian buffer.
+pub(crate) fn guess_landscape_or_object_gray(
+    gray: &GrayImage,
+    full_lap: &image::ImageBuffer<Luma<i16>, Vec<i16>>,
+) -> PhotoMode {
+    if gray.width() == 0 || gray.height() == 0 {
+        return PhotoMode::Landscape;
     }
-    match method {
-        SharpnessMethod::FixedRegion => {
-            variance_of_laplacian(&center_crop(&gray, mode.region_fraction()))
-        }
-        SharpnessMethod::SharpestRegion => sharpest_region_score(&gray),
+    let full = variance(full_lap.as_raw().iter().copied());
+    if full <= 1.0 {
+        return PhotoMode::Landscape;
+    }
+    let center = variance_of_laplacian(&center_crop(gray, 0.5));
+    if center / full > 1.6 {
+        PhotoMode::Object
+    } else {
+        PhotoMode::Landscape
     }
 }
 
@@ -200,17 +261,12 @@ pub fn score(
 /// (typically a small aperture, front-to-back focus) is comparatively
 /// uniform. This is a coarse heuristic, not real scene classification.
 pub fn guess_landscape_or_object(rgb: &RgbImage) -> PhotoMode {
-    let gray: GrayImage = image::DynamicImage::ImageRgb8(rgb.clone()).to_luma8();
-    let full = variance_of_laplacian(&gray);
-    if full <= 1.0 {
+    let gray = image::imageops::grayscale(rgb);
+    if gray.width() == 0 || gray.height() == 0 {
         return PhotoMode::Landscape;
     }
-    let center = variance_of_laplacian(&center_crop(&gray, 0.5));
-    if center / full > 1.6 {
-        PhotoMode::Object
-    } else {
-        PhotoMode::Landscape
-    }
+    let full_lap = laplacian_filter(&gray);
+    guess_landscape_or_object_gray(&gray, &full_lap)
 }
 
 #[cfg(test)]
@@ -244,5 +300,21 @@ mod tests {
         let img = RgbImage::from_pixel(640, 480, image::Rgb([120, 120, 120]));
         let s = score(&img, PhotoMode::Landscape, None, SharpnessMethod::SharpestRegion);
         assert!(s < 1.0, "got {s}");
+    }
+
+    #[test]
+    fn empty_image_with_subject_does_not_panic() {
+        let img = RgbImage::new(0, 0);
+        let box_ = FaceBox {
+            x1: 0.0,
+            y1: 0.0,
+            x2: 10.0,
+            y2: 10.0,
+            score: 0.9,
+        };
+        assert_eq!(
+            score(&img, PhotoMode::Portrait, Some(&box_), SharpnessMethod::FixedRegion),
+            0.0
+        );
     }
 }

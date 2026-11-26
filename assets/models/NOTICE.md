@@ -3,10 +3,11 @@
 by linzai, MIT licensed (see `LICENSE` in this directory).
 
 - Input: 320x240 RGB, `(pixel - 127) / 128` per channel, CHW, batch-of-1, float32.
-- Outputs: `confidences` `[1, N, 2]` (background, face — already softmaxed) and
-  `boxes` `[1, N, 4]` (`x1, y1, x2, y2`, normalized 0..1). Prior-box decoding is
-  already baked into the exported graph, so no separate anchor-decode step is
-  needed downstream — only score thresholding + NMS.
+- Outputs: `confidences` `[1, 4420, 2]` (background, face — already softmaxed) and
+  `boxes` `[1, 4420, 4]` (raw SSD regression deltas relative to fixed priors;
+  prior-box generation and decoding are implemented in `src/classify.rs` before
+  thresholding + NMS).
+- SHA-256 (`version-RFB-320.onnx`): `faf6740b495e8b9508e6fda11e8c0368bbdde01143e8f0a3e511d0892c4d794e`
 
 ---
 
@@ -21,3 +22,4 @@ licensed (see `LICENSE-YOLOX` in this directory), release 0.1.1rc0.
   scores (objectness and class scores already sigmoided). Only the animal
   classes (bird, cat, dog, horse, sheep, cow, elephant, bear, zebra,
   giraffe) are used.
+- SHA-256 (`yolox_nano.onnx`): `c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d`

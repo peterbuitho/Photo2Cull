@@ -80,3 +80,58 @@ fn apply_exif_orientation(img: DynamicImage, orientation: Option<u16>) -> Dynami
         _ => img,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::GenericImageView;
+
+    /// 3x2 image with distinct pixel values so every orientation 1..=8 maps
+    /// corners and dimensions uniquely:
+    ///   (0,0)=1  (1,0)=2  (2,0)=3
+    ///   (0,1)=4  (1,1)=5  (2,1)=6
+    fn sample_3x2() -> DynamicImage {
+        let mut img = RgbImage::new(3, 2);
+        for y in 0..2u32 {
+            for x in 0..3u32 {
+                let v = (y * 3 + x + 1) as u8;
+                img.put_pixel(x, y, image::Rgb([v, v * 10, v * 20]));
+            }
+        }
+        DynamicImage::ImageRgb8(img)
+    }
+
+    fn grid_ids(img: &DynamicImage) -> Vec<Vec<u8>> {
+        let (w, h) = img.dimensions();
+        (0..h)
+            .map(|y| (0..w).map(|x| img.get_pixel(x, y)[0]).collect())
+            .collect()
+    }
+
+    #[test]
+    fn exif_orientations_transform_as_expected() {
+        let src = sample_3x2();
+
+        assert_eq!(grid_ids(&apply_exif_orientation(src.clone(), None)), vec![vec![1, 2, 3], vec![4, 5, 6]]);
+        assert_eq!(grid_ids(&apply_exif_orientation(src.clone(), Some(1))), vec![vec![1, 2, 3], vec![4, 5, 6]]);
+        assert_eq!(grid_ids(&apply_exif_orientation(src.clone(), Some(2))), vec![vec![3, 2, 1], vec![6, 5, 4]]);
+        assert_eq!(grid_ids(&apply_exif_orientation(src.clone(), Some(3))), vec![vec![6, 5, 4], vec![3, 2, 1]]);
+        assert_eq!(grid_ids(&apply_exif_orientation(src.clone(), Some(4))), vec![vec![4, 5, 6], vec![1, 2, 3]]);
+        assert_eq!(
+            grid_ids(&apply_exif_orientation(src.clone(), Some(5))),
+            vec![vec![1, 4], vec![2, 5], vec![3, 6]]
+        );
+        assert_eq!(
+            grid_ids(&apply_exif_orientation(src.clone(), Some(6))),
+            vec![vec![4, 1], vec![5, 2], vec![6, 3]]
+        );
+        assert_eq!(
+            grid_ids(&apply_exif_orientation(src.clone(), Some(7))),
+            vec![vec![6, 3], vec![5, 2], vec![4, 1]]
+        );
+        assert_eq!(
+            grid_ids(&apply_exif_orientation(src, Some(8))),
+            vec![vec![3, 6], vec![2, 5], vec![1, 4]]
+        );
+    }
+}
